@@ -125,6 +125,12 @@ struct SessionCard {
     status: String,
     has_summary: bool,
     speaker_count: Option<u32>,
+    /// 对应的工程目录是否还在。
+    ///
+    /// 历史记录与工程是**两套独立存储**,删掉工程后会话记录仍保留
+    /// (这是刻意的:它记录了"这段录音处理过")。
+    /// 界面据此把那一条标成「工程已删除」,免得点进去什么都没有。
+    project_exists: bool,
 }
 
 #[derive(Serialize)]
@@ -146,6 +152,11 @@ struct SessionDetail {
     labels: Vec<SpeakerRow>,
     used_map_reduce: bool,
     usage_text: Option<String>,
+    /// 原始录音路径(处理时拖进来的那个文件,在应用目录之外)。
+    ///
+    /// 删除工程时界面会问"要不要一并删掉它" —— 所以要让用户看见是哪一份。
+    /// 可能是 `None`(会话记录不在,或当时没记)。
+    audio_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -207,8 +218,7 @@ struct RunOutcomeDto {
     from_cache: bool,
     scene_label: Option<String>,
     scene_confidence: Option<f32>,
-    scene_low_confidence: bool,
-    summary: Option<String>,
+    scene_low_confidence: bool,    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +381,18 @@ fn list_sessions(state: State<AppState>, limit: Option<usize>) -> Result<Vec<Ses
     let files = state.files().map_err(err_str)?;
     let rows = db.list_sessions(limit.unwrap_or(100)).map_err(err_str)?;
 
+    // 一次性建出"工程 ID → 目录"的表,避免每行都去遍历 projects/
+    let projects = {
+        use rs_core::project::ProjectStore;
+        let store = ProjectStore::new(files.root());
+        store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.meta.id.clone(), p.dir.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -395,6 +417,12 @@ fn list_sessions(state: State<AppState>, limit: Option<usize>) -> Result<Vec<Ses
                 status: r.status.clone(),
                 has_summary,
                 speaker_count,
+                // 工程目录还在吗 —— 删了工程之后会话记录仍保留,
+                // 界面据此把它标成「工程已删除」
+                project_exists: projects
+                    .get(&r.id)
+                    .map(|d| d.is_dir())
+                    .unwrap_or(false),
                 id: r.id,
             }
         })
@@ -417,6 +445,12 @@ fn get_session(state: State<AppState>, id: String) -> Result<SessionDetail, Stri
 
     let summary_md = files.read_summary_markdown(&full_id).map_err(err_str)?;
     let summary_meta = files.read_summary_meta(&full_id).map_err(err_str)?;
+    // 原始录音路径 —— 删除工程时界面会问"要不要一并删掉它"
+    let audio_path = state
+        .db()
+        .ok()
+        .and_then(|db| db.get_session(&full_id).ok().flatten())
+        .and_then(|s| s.audio_local_path);
     let db = state.db().map_err(err_str)?;
     let row = db.get_session(&full_id).map_err(err_str)?;
 
@@ -486,6 +520,7 @@ fn get_session(state: State<AppState>, id: String) -> Result<SessionDetail, Stri
         used_map_reduce: summary_meta.as_ref().map(|m| m.used_map_reduce).unwrap_or(false),
         usage_text,
         id: full_id,
+        audio_path,
     })
 }
 
@@ -1872,6 +1907,8 @@ struct RenameProjectResult {
     slug_changed: bool,
     /// 旧目录名
     old_slug: String,
+    /// 会话表标题没同步成功时的说明(工程本身已改好)
+    title_sync_warning: Option<String>,
 }
 
 /// 重命名工程:标题与目录名一起改。
@@ -1899,13 +1936,88 @@ fn rename_project(
         .title
         .clone();
 
-    let out = store.rename(&id, &title).map_err(err_str)?;
+    // ★ 用共用的那份实现 —— 它会一并同步会话表标题。
+    //
+    //   标题在两处各存一份(project.json 与 sessions.title),
+    //   靠音频内容哈希关联但是两套独立存储。只改一处的话,
+    //   同一个录音在「我的工程」和「历史记录」会显示不同的名字。
+    let db = state.db().map_err(err_str)?;
+    let out = rs_core::project::rename_project_synced(&store, &db, &id, &title)
+        .map_err(err_str)?;
+
     Ok(RenameProjectResult {
         dir: out.dir.to_string_lossy().to_string(),
         old_title,
         new_title: title,
         slug_changed: out.slug_changed,
         old_slug: out.old_slug,
+        title_sync_warning: out.warning,
+    })
+}
+
+/// 删除工程的结果,给界面做结果提示用。
+#[derive(serde::Serialize)]
+struct DeleteProjectResult {
+    id: String,
+    title: String,
+    bytes_freed: u64,
+    files_deleted: usize,
+    /// 一并删掉的按哈希命名的产物文件数
+    content_files_deleted: usize,
+    /// **没删**的产物文件数(有别的工程共享同一个录音时为非零)
+    content_files_kept: usize,
+    /// 云端是否可能还有一份 —— 界面据此提醒去「云端管理」清理
+    maybe_in_cloud: bool,
+    source_audio: Option<String>,
+    source_deleted: bool,
+}
+
+/// 删除工程。
+///
+/// 删工程目录(含音频副本)与按哈希命名的产物文件。
+/// **历史记录与云端副本不动** —— 见 [`rs_core::project::delete_project`]。
+#[tauri::command]
+fn delete_project(
+    state: State<AppState>,
+    id: String,
+    delete_source: Option<bool>,
+) -> Result<DeleteProjectResult, String> {
+    use rs_core::project::ProjectStore;
+    let files = state.files().map_err(err_str)?;
+    let db = state.db().map_err(err_str)?;
+    let store = ProjectStore::new(files.root());
+
+    let manifest = sync::manifest::Manifest::load_or_new(&files.manifest_path())
+        .map_err(err_str)?;
+
+    // 先按 ID 前缀解析出**目录** —— 同一个音频可以建多个工程,
+    // 那时 ID 不唯一,只有目录能唯一定位。
+    let p = store
+        .find(&id)
+        .map_err(err_str)?
+        .ok_or_else(|| format!("找不到工程: {id}"))?;
+
+    let out = rs_core::project::delete_project(
+        &store,
+        &files,
+        &db,
+        &p.dir,
+        delete_source.unwrap_or(false),
+    )
+    .map_err(err_str)?;
+
+    let maybe_in_cloud = out.had_cloud_copy(&manifest);
+
+    Ok(DeleteProjectResult {
+        id: out.id,
+        title: out.title,
+        bytes_freed: out.bytes_freed,
+        files_deleted: out.files_deleted,
+        content_files_deleted: out.content_files_deleted.len(),
+        content_files_kept: out.content_files_kept.len(),
+        maybe_in_cloud,
+        source_audio: out.source_audio.map(|p| p.to_string_lossy().to_string()),
+        source_deleted: out.source_deleted,
     })
 }
 
@@ -2230,6 +2342,7 @@ fn main() {
             list_project_files,
             open_project_dir,
             rename_project,
+            delete_project,
             save_mermaid_source,
             save_png,
             get_stats,

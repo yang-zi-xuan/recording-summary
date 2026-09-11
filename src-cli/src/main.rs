@@ -284,6 +284,21 @@ enum ProjectAction {
         /// 新标题
         title: String,
     },
+    /// 删除工程
+    ///
+    /// 删掉工程目录(含音频副本)与按内容哈希命名的产物文件。
+    /// **历史记录与云端副本不动** —— 前者记录"这段录音处理过",
+    /// 后者要在「云端管理」里显式删。
+    Delete {
+        /// 工程 ID(或前缀)
+        id: String,
+        /// 跳过确认
+        #[arg(long)]
+        yes: bool,
+        /// 同时删掉原始录音(应用目录之外的那个文件)
+        #[arg(long)]
+        source: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -917,7 +932,6 @@ fn cmd_projects(data_dir: &std::path::Path, action: Option<ProjectAction>) -> Re
 
     let files = open_files(data_dir)?;
     let store = ProjectStore::new(files.root());
-
     match action.unwrap_or(ProjectAction::List) {
         ProjectAction::List => {
             let list = store.list()?;
@@ -1062,10 +1076,17 @@ fn cmd_projects(data_dir: &std::path::Path, action: Option<ProjectAction>) -> Re
             let old_title = p.meta.title.clone();
             let old_dir = p.dir.clone();
 
-            let out = store.rename(&id, &title)?;
+            // ★ 用共用的那份实现 —— 它会一并同步会话表标题。
+            //   之前 CLI 这里是手写的一套,漏了同步,于是"用 CLI 改名"
+            //   和"用 GUI 改名"结果不一样。
+            let db = Db::open(&data_dir.join("cache.db"))?;
+            let out = rs_core::project::rename_project_synced(&store, &db, &id, &title)?;
 
             println!("✅ 已重命名");
             println!("   标题: {old_title} → {}", store.find(&id)?.unwrap().meta.title);
+            if let Some(w) = &out.warning {
+                println!("   ⚠ {w}");
+            }
             if out.slug_changed {
                 println!("   目录: {}", old_dir.display());
                 println!("      → {}", out.dir.display());
@@ -1077,6 +1098,81 @@ fn cmd_projects(data_dir: &std::path::Path, action: Option<ProjectAction>) -> Re
                 println!("   (或等同步的删除策略处理 —— 但那只对在范围内的文件生效)。");
             } else {
                 println!("   (目录名未变,只有标题更新了)");
+            }
+        }
+
+        ProjectAction::Delete { id, yes, source } => {
+            let p = store
+                .find(&id)?
+                .ok_or_else(|| anyhow::anyhow!("找不到工程: {id}"))?;
+
+            let (n, bytes) = rs_core::project::project_stats(&p.dir);
+            let db = Db::open(&data_dir.join("cache.db"))?;
+            let manifest =
+                rs_core::sync::manifest::Manifest::load_or_new(&files.manifest_path())?;
+            let in_cloud = manifest
+                .live_files()
+                .any(|(k, _)| k.starts_with("projects/") && k.contains(&p.meta.id));
+
+            if !yes {
+                println!("将要删除:");
+                println!("  工程    : {}", p.meta.title);
+                println!("  目录    : {}", p.dir.display());
+                println!("  大小    : {} ({n} 个文件)", human_size(bytes));
+                println!();
+                println!("保留:");
+                println!("  历史记录: 会保留,之后显示为「工程已删除」");
+                if in_cloud {
+                    println!("  云端副本: **会保留** —— 需要到「云端管理」里单独删");
+                }
+                if let Some(src) = db
+                    .get_session(&p.meta.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.audio_local_path)
+                {
+                    println!(
+                        "  原始录音: {src}{}",
+                        if source { "(本次一并删除)" } else { "(保留)" }
+                    );
+                }
+                println!();
+                print!("确认删除?输入 yes 继续:");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim() != "yes" {
+                    println!("已取消。");
+                    return Ok(());
+                }
+            }
+
+            let out = rs_core::project::delete_project(&store, &files, &db, &p.dir, source)?;
+
+            println!("✅ 已删除工程「{}」", out.title);
+            println!(
+                "   释放 {} ({n} 个文件)",
+                human_size(out.bytes_freed),
+                n = out.files_deleted
+            );
+            if !out.content_files_deleted.is_empty() {
+                println!("   一并删掉 {} 个产物缓存文件", out.content_files_deleted.len());
+            }
+            if !out.content_files_kept.is_empty() {
+                println!(
+                    "   ⚠ 保留 {} 个产物文件 —— 有别的工程用同一个录音",
+                    out.content_files_kept.len()
+                );
+            }
+            if out.source_deleted {
+                println!("   原始录音已删除");
+            }
+            println!();
+            println!("ℹ 历史记录保留着(「历史记录」里会显示为「工程已删除」)。");
+            if in_cloud {
+                println!("ℹ 云端副本**还在** —— 到「云端管理」里删,或用:");
+                println!("     rs sync plan        # 先看看云端有哪些");
             }
         }
     }

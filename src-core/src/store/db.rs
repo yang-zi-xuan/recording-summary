@@ -29,6 +29,29 @@ pub struct SessionRow {
     pub origin_device: Option<String>,
 }
 
+impl SessionRow {
+    /// 造一条最小可用的会话记录,给测试用。
+    ///
+    /// 字段多但大多有合理默认值,测试里只关心其中一两个 ——
+    /// 让调用方按需覆盖,比每次写全 11 个字段省事得多。
+    #[doc(hidden)]
+    pub fn new_for_test(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            title: None,
+            created_at: now_ms(),
+            duration_ms: 0,
+            audio_local_path: None,
+            source_type: "file".into(),
+            status: "done".into(),
+            scene: None,
+            scene_confidence: None,
+            last_modified_at: now_ms(),
+            origin_device: None,
+        }
+    }
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -229,6 +252,35 @@ impl Db {
             params![id, status, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// 只改标题。
+    ///
+    /// # 什么时候需要它
+    ///
+    /// **工程重命名。** 标题在两处各有一份:
+    ///
+    /// - `projects/<目录>/project.json` 的 `title` —— 「我的工程」读它
+    /// - `sessions.title` —— 「历史记录」和「处理录音」页读它
+    ///
+    /// 两边用同一个 ID(音频内容哈希)关联,但**是两套独立存储**。
+    /// 只改一处会出现"同一个录音在两个页面显示不同名字"。
+    pub fn set_session_title(&self, id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET title = ?2, last_modified_at = ?3 WHERE id = ?1",
+            params![id, title, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// 会话是否存在。用于"工程改名时顺带补一条会话记录"。
+    pub fn session_exists(&self, id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {

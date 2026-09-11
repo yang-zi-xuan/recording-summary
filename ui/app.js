@@ -836,6 +836,90 @@ $('btnOpenDir').addEventListener('click', async () => {
   }
 });
 
+/** 删除工程。
+ *
+ *  这是**不可撤销**的动作,所以确认框里逐条写清删什么、留什么。
+ *
+ *  「留什么」比「删什么」更需要说清楚 —— 用户最怕的是
+ *  "我删了本地,云端那份是不是也没了"。
+ */
+$('btnDeleteProject').addEventListener('click', async () => {
+  if (!currentProject) return;
+  const p = currentProject;
+
+  // 原始录音只在会话表里有记录时才提示
+  let srcLine = '';
+  try {
+    const sess = await invoke('get_session', { id: p.id });
+    if (sess && sess.audio_path) srcLine = sess.audio_path;
+  } catch {
+    /* 会话记录不在就不提这一项 */
+  }
+
+  const delSource = srcLine
+    ? confirm(
+        '是否**同时删除原始录音**?\n\n' +
+          srcLine +
+          '\n\n' +
+          '· 确定 = 一并删掉(彻底腾出空间)\n' +
+          '· 取消 = 保留(只删工程)\n\n' +
+          '(工程目录里已有一份音频副本,删了原始文件不影响播放)'
+      )
+    : false;
+
+  const msg =
+    `删除这个工程?\n\n` +
+    `${p.title}\n\n` +
+    `会删掉:\n` +
+    `· 工程目录(含音频副本)\n` +
+    `· 转写 / 总结 / 说话人标签的缓存文件\n` +
+    (delSource ? `· 原始录音 ${srcLine}\n` : '') +
+    `\n**不会删**:\n` +
+    `· 历史记录(会保留,并标记为「工程已删除」)\n` +
+    `· 云端副本(需要到「云端管理」里单独删)\n` +
+    `\n⚠ 本地删除不可撤销。`;
+
+  if (!confirm(msg)) return;
+
+  try {
+    const r = await invoke('delete_project', {
+      id: p.id,
+      deleteSource: delSource,
+    });
+
+    // 记到同步日志里,便于回溯
+    logTo(
+      $('syncLog'),
+      `🗑 已删除工程「${r.title}」,释放 ${fmtBytes(r.bytes_freed)}`,
+      'ln-warn'
+    );
+
+    let report = `已删除工程「${r.title}」\n\n释放 ${fmtBytes(r.bytes_freed)}(${r.files_deleted} 个文件)`;
+    if (r.content_files_deleted) {
+      report += `\n一并清理了 ${r.content_files_deleted} 个产物缓存文件`;
+    }
+    if (r.content_files_kept) {
+      report += `\n\n⚠ 保留 ${r.content_files_kept} 个产物文件 —— 有别的工程用同一个录音,不能删`;
+    }
+    if (r.source_deleted) {
+      report += `\n原始录音已删除`;
+    }
+    report += `\n\n历史记录保留着(会显示为「工程已删除」)。`;
+    if (r.maybe_in_cloud) {
+      report +=
+        `\n\n⚠ **云端副本还在。**\n` +
+        `到「云端同步 → 云端管理」里找到这个工程删掉,云端空间才会释放。`;
+    }
+    alert(report);
+
+    // 回列表
+    gotoView('projects');
+    await loadProjects();
+  } catch (e) {
+    alert('删除失败:' + e);
+  }
+});
+
 /** 复制到剪贴板;失败时静默(alert 里已经给了路径)。 */
 async function copyToClipboard(text) {
   try {
@@ -1052,9 +1136,11 @@ async function loadHistory() {
     box.innerHTML = rows
       .map(
         (r) => `
-      <div class="item" data-id="${r.id}">
+      <div class="item ${r.project_exists ? '' : 'gone'}" data-id="${r.id}">
         <div class="item-main">
-          <div class="item-title">${escapeHtml(r.title)}</div>
+          <div class="item-title">${escapeHtml(r.title)}${
+            r.project_exists ? '' : ' <span class="chip">工程已删除</span>'
+          }</div>
           <div class="item-sub">
             ${r.short_id} · ${r.duration_text} · ${fmtTime(r.created_at)}
             ${r.scene_label ? ' · ' + r.scene_label : ''}
@@ -1062,12 +1148,19 @@ async function loadHistory() {
           </div>
         </div>
         <div class="item-right">
-          ${r.has_summary ? '<span class="chip ok">有纪要</span>' : '<span class="chip">仅转写</span>'}
+          ${
+            r.project_exists
+              ? r.has_summary
+                ? '<span class="chip ok">有纪要</span>'
+                : '<span class="chip">仅转写</span>'
+              : '<span class="chip warn">只剩历史</span>'
+          }
         </div>
       </div>`
       )
       .join('');
-    box.querySelectorAll('.item').forEach((el) =>
+    // 工程已删除的条目点了没内容可看 —— 不绑事件,视觉上也淡掉
+    box.querySelectorAll('.item:not(.gone)').forEach((el) =>
       el.addEventListener('click', () => openSession(el.dataset.id))
     );
   } catch (e) {

@@ -464,6 +464,7 @@ impl ProjectStore {
             np.save_meta()?;
             return Ok(RenameOutcome {
                 dir: old_dir,
+                full_id: p.meta.id.clone(),
                 old_slug,
                 slug_changed: false,
                 warning: None,
@@ -495,6 +496,7 @@ impl ProjectStore {
 
         Ok(RenameOutcome {
             dir: target,
+            full_id: p.meta.id.clone(),
             old_slug,
             slug_changed: true,
             warning: None,
@@ -502,11 +504,281 @@ impl ProjectStore {
     }
 }
 
+/// 按目录找工程。
+///
+/// # 为什么删除必须按目录而不是按 ID
+///
+/// `find()` 按 ID 前缀查找。但**同一个音频可以建多个工程** ——
+/// 处理两次就会出现两个 ID 相同、目录不同的工程。那时 `find()` 会
+/// 报"匹配到多个工程"而拒绝,删除就没法进行。
+///
+/// 目录是唯一的,所以删除按目录定位。ID 前缀只用于"帮用户找到目录"。
+pub fn load_project_dir(dir: &Path) -> Result<Option<Project>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    load_project(dir)
+}
+
+/// 删除一个工程时,哪些东西被删了、哪些没动。
+///
+/// 每一项都写清楚,是因为"删除"这个动作最怕含糊 ——
+/// 用户需要知道云端还在不在、原始录音还在不在。
+#[derive(Clone, Debug, Default)]
+pub struct DeleteOutcome {
+    /// 工程 ID
+    pub id: String,
+    /// 被删的工程标题
+    pub title: String,
+    /// 被删的工程目录
+    pub dir: PathBuf,
+    /// 工程目录占用的字节数
+    pub bytes_freed: u64,
+    /// 目录里的文件数
+    pub files_deleted: usize,
+    /// 一并删掉的按哈希命名的内容文件(transcript/summary/labels)
+    pub content_files_deleted: Vec<PathBuf>,
+    /// **没删**的内容文件。有别的工程用同一个音频时会出现 ——
+    /// 那些文件是共享的,删了会连带毁掉另一个工程。
+    pub content_files_kept: Vec<PathBuf>,
+    /// 原始录音路径(如果会话表里有记录)
+    pub source_audio: Option<PathBuf>,
+    /// 原始录音是否真的被删了
+    pub source_deleted: bool,
+}
+
+impl DeleteOutcome {
+    /// 这个工程在同步清单里有没有记录。
+    ///
+    /// 有就说明云端可能还留着一份,**调用方应当提醒用户** ——
+    /// 删除只在本地生效,云端要另外清(「云端管理」里有删除按钮)。
+    pub fn had_cloud_copy(&self, manifest: &crate::sync::manifest::Manifest) -> bool {
+        let needle = format!("/{}/", self.id);
+        manifest
+            .live_files()
+            .any(|(k, _)| k.starts_with("projects/") && k.contains(&needle))
+    }
+}
+
+/// 删除一个工程。
+///
+/// `dir` 是**工程目录**(不是 ID 前缀)—— 见 [`load_project_dir`] 里
+/// 关于"同 ID 多工程"的说明。
+///
+/// # 删什么
+///
+/// 1. **工程目录**(含里面的音频副本)—— 这是主体
+/// 2. **按内容哈希命名的内容文件**(transcript / summary / speaker_labels)
+///
+/// # 不删什么,以及为什么
+///
+/// - **历史记录(sessions 表)不动。** 用户明确要求保留 —— 它记录了
+///   "这段录音处理过",工程只是它的一个视图。删掉工程后,历史记录里
+///   那条会显示为"工程已删除"。
+/// - **云端副本不动。** 删除只在本地生效。云端的清理是用户显式动作
+///   (「云端管理」里有删除按钮),自动删云端会让"手滑删本地"变成
+///   "云端也没了"。调用方应当在结果里提醒用户。
+/// - **声纹档案不动。** 它是全局的,跨会话存在,不属于某一个工程。
+///
+/// # 共享内容文件的保护
+///
+/// 内容文件按**音频内容哈希**命名,所以同一个音频只存一份。
+/// 删除前会检查 store 里是否还有**别的工程**用同一个 ID;
+/// 有的话那些文件保留,记进 `content_files_kept`。
+///
+/// # 原始录音
+///
+/// 默认**不动**。它在应用的存储目录之外(用户的 Downloads 之类),
+/// 删除别人的文件不该是默认行为。要删的话由调用方显式传 `delete_source`。
+pub fn delete_project(
+    store: &ProjectStore,
+    files: &crate::store::files::FileStore,
+    db: &crate::store::db::Db,
+    dir: &Path,
+    delete_source: bool,
+) -> Result<DeleteOutcome> {
+    let p = load_project_dir(dir)?
+        .ok_or_else(|| anyhow!("找不到工程目录: {}", dir.display()))?;
+
+    let id = p.meta.id.clone();
+    let title = p.meta.title.clone();
+    let dir = p.dir.clone();
+
+    let mut out = DeleteOutcome {
+        id: id.clone(),
+        title,
+        dir: dir.clone(),
+        ..Default::default()
+    };
+
+    // ---- 1. 内容文件(先判断共享)----
+    //
+    // 必须**在删目录之前**检查:别的工程是否也用这个 ID。
+    // 用同一个音频建的第二个工程会共享这些文件。
+    let others_share = store.list()?.into_iter().any(|q| q.meta.id == id && q.dir != dir);
+
+    let content: Vec<PathBuf> = [
+        files.transcript_path(&id),
+        files.summary_path(&id),
+        // meta 是 summary.md 的旁挂文件(write_summary 里用 with_extension)
+        files.summary_path(&id).with_extension("meta.json"),
+        files.labels_path(&id),
+    ]
+    .into_iter()
+    .filter(|f| f.exists())
+    .collect();
+
+    if others_share {
+        out.content_files_kept = content;
+    } else {
+        for f in content {
+            match std::fs::remove_file(&f) {
+                Ok(()) => out.content_files_deleted.push(f),
+                // 删不掉不算失败 —— 记下来让调用方报告,别让整次删除中断
+                Err(e) => {
+                    tracing::warn!("删除内容文件失败 {}: {e}", f.display());
+                    out.content_files_kept.push(f);
+                }
+            }
+        }
+        // 清掉可能空掉的分片目录
+        prune_empty_shards(files, &id);
+    }
+
+    // ---- 2. 工程目录 ----
+    let (files_n, bytes) = dir_stats(&dir);
+    out.files_deleted = files_n;
+    out.bytes_freed = bytes;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("删除工程目录失败: {}", dir.display()))?;
+    }
+
+    // ---- 3. 原始录音(可选)----
+    out.source_audio = db
+        .get_session(&id)
+        .ok()
+        .flatten()
+        .and_then(|s| s.audio_local_path)
+        .map(PathBuf::from);
+
+    if delete_source {
+        if let Some(src) = &out.source_audio {
+            // 只删文件,不递归 —— 万一记的是个目录,不动它
+            if src.is_file() {
+                match std::fs::remove_file(src) {
+                    Ok(()) => out.source_deleted = true,
+                    Err(e) => tracing::warn!("删除原始录音失败 {}: {e}", src.display()),
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// 内容文件删完后,把空掉的分片目录(`transcript/1f/` 之类)也清掉。
+///
+/// 失败**静默忽略** —— 留个空目录不影响任何功能,不值得为它报错。
+fn prune_empty_shards(files: &crate::store::files::FileStore, id: &str) {
+    let shard = crate::types::hash_shard(id);
+    if shard.is_empty() {
+        return;
+    }
+    for kind in ["transcript", "summary", "speaker_labels"] {
+        let d = files.root().join(kind).join(shard);
+        if d.is_dir()
+            && std::fs::read_dir(&d)
+                .map(|mut i| i.next().is_none())
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(&d);
+        }
+    }
+}
+
+/// 统计一个工程目录的文件数与字节数。
+///
+/// 也用于删除前的确认("将要释放 148.5 MB")。
+pub fn project_stats(dir: &Path) -> (usize, u64) {
+    dir_stats(dir)
+}
+
+/// 递归统计目录里的文件数与总字节数。
+///
+/// 目录不存在时返回 `(0, 0)` —— 调用方在删之前想知道"能腾出多少",
+/// 不该因为目录已经不在就报错。
+fn dir_stats(dir: &Path) -> (usize, u64) {
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                let (cn, cb) = dir_stats(&e.path());
+                n += cn;
+                bytes += cb;
+            }
+            Ok(t) if t.is_file() => {
+                n += 1;
+                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    (n, bytes)
+}
+
+/// 重命名工程,**并同步会话表里的标题**。
+///
+/// # 为什么要有这个函数(而不是让调用方各写一遍)
+///
+/// 标题在两处各存一份:
+///
+/// ```text
+/// projects/<目录>/project.json 的 title   →  「我的工程」读它
+/// sessions.title                          →  「历史记录」「处理录音」读它
+/// ```
+///
+/// 两边用同一个 ID(音频内容哈希)关联,但是两套独立存储。
+/// **只改一处,同一个录音就会在两个页面显示不同的名字。**
+///
+/// 最初 CLI 和 GUI 各写了一遍改名逻辑,GUI 那份同步了会话表、CLI 那份漏了 ——
+/// 于是"用什么入口改名"决定了标题会不会一致。抽成一个函数就没有这个空间。
+///
+/// # 数据库失败不算改名失败
+///
+/// 工程才是真相源。会话表只是索引,它没跟上最多是历史记录显示旧名字,
+/// 下次改名或重建索引就能补回来。所以这里返回 `title_sync_warning`
+/// 让调用方去提示,而不是把整次改名判为失败。
+pub fn rename_project_synced(
+    store: &ProjectStore,
+    db: &crate::store::db::Db,
+    id_prefix: &str,
+    new_title: &str,
+) -> Result<RenameOutcome> {
+    let mut out = store.rename(id_prefix, new_title)?;
+
+    match db.set_session_title(&out.full_id, new_title.trim()) {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::warn!("更新会话标题失败(历史记录可能显示旧名字): {e}");
+            out.warning = Some(format!("历史记录里的名字没更新:{e}"));
+        }
+    }
+    Ok(out)
+}
+
 /// 重命名的结果。
 #[derive(Clone, Debug)]
 pub struct RenameOutcome {
     /// 改名后的目录
     pub dir: PathBuf,
+    /// 工程 ID(音频内容哈希)。调用方需要它来同步会话表标题 ——
+    /// 标题在工程与会话表两处各有一份,靠这个 ID 关联。
+    pub full_id: String,
     /// 原来的目录名(用于提醒云端路径已变)
     pub old_slug: String,
     /// 目录名是否真的变了
@@ -936,6 +1208,227 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2000-03-01(闰年边界附近)
         assert_eq!(civil_from_days(11017), (2000, 3, 1));
+    }
+
+    // --- 删除工程 ----------------------------------------------------------
+
+    /// 测试用的一整套 store + files + db。
+    fn del_fixture() -> (
+        tempfile::TempDir,
+        ProjectStore,
+        crate::store::files::FileStore,
+        crate::store::db::Db,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let files = crate::store::files::FileStore::new(dir.path().join("store"));
+        files.ensure_dirs().unwrap();
+        let db = crate::store::db::Db::open(&dir.path().join("store").join("cache.db")).unwrap();
+        let store = ProjectStore::new(files.root());
+        (dir, store, files, db)
+    }
+
+    #[test]
+    fn delete_removes_project_dir_and_content_files() {
+        let (_d, store, files, db) = del_fixture();
+        let p = store.create_or_open("hash_del", "待删除").unwrap();
+        std::fs::write(p.dir.join(TRANSCRIPT_MD), "转写").unwrap();
+        // 也放一份按哈希命名的产物
+        let tp = files.transcript_path("hash_del");
+        std::fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        std::fs::write(&tp, "{}").unwrap();
+
+        let out = delete_project(&store, &files, &db, &p.dir, false).unwrap();
+
+        assert!(!out.dir.exists(), "工程目录应已删除");
+        assert!(!tp.exists(), "按哈希命名的产物也应删除");
+        assert!(out.bytes_freed > 0, "应统计出释放的字节数");
+        assert!(out.files_deleted > 0);
+        assert!(store.find("hash_del").unwrap().is_none(), "应查不到这个工程了");
+    }
+
+    #[test]
+    fn delete_keeps_session_record() {
+        // ★ 用户明确要求:删工程保留历史记录 ——
+        //   它记录了"这段录音处理过",工程只是它的一个视图。
+        let (_d, store, files, db) = del_fixture();
+        let mut row = crate::store::db::SessionRow::new_for_test("hash_keep_sess");
+        row.title = Some("留着".into());
+        db.upsert_session(&row).unwrap();
+
+        let p = store.create_or_open("hash_keep_sess", "工程").unwrap();
+        delete_project(&store, &files, &db, &p.dir, false).unwrap();
+
+        let s = db.get_session("hash_keep_sess").unwrap();
+        assert!(s.is_some(), "★ 会话记录必须保留");
+        assert_eq!(s.unwrap().title.as_deref(), Some("留着"));
+    }
+
+    #[test]
+    fn delete_keeps_source_audio_by_default() {
+        // ★ 原始录音在应用目录之外,默认不碰
+        let (_d, store, files, db) = del_fixture();
+        let src = _d.path().join("外部录音.m4a");
+        std::fs::write(&src, b"audio bytes").unwrap();
+
+        let mut row = crate::store::db::SessionRow::new_for_test("hash_src");
+        row.audio_local_path = Some(src.to_string_lossy().to_string());
+        db.upsert_session(&row).unwrap();
+        let p = store.create_or_open("hash_src", "工程").unwrap();
+
+        let out = delete_project(&store, &files, &db, &p.dir, false).unwrap();
+
+        assert!(src.is_file(), "★ 默认不删原始录音");
+        assert!(!out.source_deleted);
+        assert_eq!(out.source_audio.as_deref(), Some(src.as_path()));
+    }
+
+    #[test]
+    fn delete_removes_source_audio_when_asked() {
+        let (_d, store, files, db) = del_fixture();
+        let src = _d.path().join("要删的录音.m4a");
+        std::fs::write(&src, b"audio bytes").unwrap();
+
+        let mut row = crate::store::db::SessionRow::new_for_test("hash_src2");
+        row.audio_local_path = Some(src.to_string_lossy().to_string());
+        db.upsert_session(&row).unwrap();
+        let p = store.create_or_open("hash_src2", "工程").unwrap();
+
+        let out = delete_project(&store, &files, &db, &p.dir, true).unwrap();
+
+        assert!(!src.exists(), "显式要求时应删掉原始录音");
+        assert!(out.source_deleted);
+    }
+
+    #[test]
+    fn delete_keeps_content_files_shared_with_another_project() {
+        // ★ 内容文件按**音频内容哈希**命名,同一个音频只存一份。
+        //   用同一个音频建的第二个工程会共享它 —— 删一个不能连带毁掉另一个。
+        let (_d, store, files, db) = del_fixture();
+        let a = store.create_or_open("same_hash", "第一讲").unwrap();
+        // 手工造一个同 ID 的第二个工程(create_or_open 遇到同 ID 会复用)
+        let b_dir = store.projects_dir().join("2026-01-02_第二讲");
+        std::fs::create_dir_all(b_dir.join(AUDIO_DIR)).unwrap();
+        let mut meta = a.meta.clone();
+        meta.slug = "2026-01-02_第二讲".into();
+        meta.title = "第二讲".into();
+        Project {
+            dir: b_dir.clone(),
+            meta,
+        }
+        .save_meta()
+        .unwrap();
+
+        let tp = files.transcript_path("same_hash");
+        std::fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        std::fs::write(&tp, "{}").unwrap();
+
+        let out = delete_project(&store, &files, &db, &a.dir, false).unwrap();
+
+        assert!(!out.dir.exists(), "被删的那个工程目录应消失");
+        assert!(b_dir.is_dir(), "★ 同 ID 的另一个工程必须完好");
+        assert!(tp.is_file(), "★ 共享的产物文件必须保留");
+        assert_eq!(out.content_files_kept.len(), 1);
+        assert!(out.content_files_deleted.is_empty());
+    }
+
+    #[test]
+    fn delete_unshares_after_the_other_project_is_gone() {
+        // 只剩一个工程时,产物文件就该删掉了
+        let (_d, store, files, db) = del_fixture();
+        let p = store.create_or_open("h", "唯一").unwrap();
+        let tp = files.transcript_path("h");
+        std::fs::create_dir_all(tp.parent().unwrap()).unwrap();
+        std::fs::write(&tp, "{}").unwrap();
+
+        let out = delete_project(&store, &files, &db, &p.dir, false).unwrap();
+        assert!(out.content_files_kept.is_empty());
+        assert_eq!(out.content_files_deleted.len(), 1);
+        assert!(!tp.exists());
+    }
+
+    #[test]
+    fn delete_prunes_empty_shard_dirs() {
+        let (_d, store, files, db) = del_fixture();
+        let p = store.create_or_open("h", "T").unwrap();
+        let tp = files.transcript_path("h");
+        let shard_dir = tp.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        std::fs::write(&tp, "{}").unwrap();
+
+        delete_project(&store, &files, &db, &p.dir, false).unwrap();
+        assert!(!shard_dir.exists(), "空掉的分片目录应被清掉");
+    }
+
+    #[test]
+    fn delete_rejects_unknown_project() {
+        let (_d, store, files, db) = del_fixture();
+        let e = delete_project(&store, &files, &db, std::path::Path::new("nope"), false).unwrap_err();
+        assert!(e.to_string().contains("找不到"), "{e}");
+    }
+
+    #[test]
+    fn delete_supports_id_prefix() {
+        let (_d, store, files, db) = del_fixture();
+        let p = store.create_or_open("abcdef123456", "前缀").unwrap();
+        let out = delete_project(&store, &files, &db, &p.dir, false).unwrap();
+        assert_eq!(out.id, "abcdef123456");
+    }
+
+    #[test]
+    fn delete_reports_cloud_copy_from_manifest() {
+        // 有同步记录时调用方要提醒"云端还在"
+        use crate::sync::manifest::{Manifest, ManifestEntry};
+        let (_d, store, files, db) = del_fixture();
+        let p = store.create_or_open("cid", "云端有").unwrap();
+        let out = delete_project(&store, &files, &db, &p.dir, false).unwrap();
+
+        let mut m = Manifest::new();
+        assert!(!out.had_cloud_copy(&m), "空清单 → 没有云端副本");
+
+        m.record(
+            "projects/2026-01-01_x/audio/recording.m4a",
+            ManifestEntry {
+                etag: Some("\"e\"".into()),
+                size: Some(1),
+                synced_at: 1,
+                origin: Some("dev".into()),
+                deleted_at: None,
+            },
+        );
+        // 路径里不含这个 ID → 仍算没有
+        assert!(!out.had_cloud_copy(&m));
+
+        m.record(
+            &format!("projects/2026-01-01_x/{}/audio.m4a", out.id),
+            ManifestEntry {
+                etag: Some("\"e\"".into()),
+                size: Some(1),
+                synced_at: 1,
+                origin: Some("dev".into()),
+                deleted_at: None,
+            },
+        );
+        assert!(out.had_cloud_copy(&m), "★ 路径含这个 ID 时才算云端有副本");
+    }
+
+    #[test]
+    fn project_stats_counts_files_and_bytes() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("h", "统计").unwrap();
+        std::fs::write(p.dir.join("a.txt"), "12345").unwrap();
+        std::fs::write(p.dir.join(AUDIO_DIR).join("b.txt"), "123").unwrap();
+
+        // create_or_open 会写一个 project.json,所以总共 3 个文件
+        let meta_bytes = std::fs::metadata(p.dir.join(META_JSON)).unwrap().len();
+        let (n, bytes) = project_stats(&p.dir);
+        assert_eq!(n, 3, "a.txt + audio/b.txt + project.json");
+        assert_eq!(bytes, 5 + 3 + meta_bytes);
+    }
+
+    #[test]
+    fn dir_stats_on_missing_dir_is_zero() {
+        let (n, b) = dir_stats(std::path::Path::new("D:\\definitely\\not\\here"));
+        assert_eq!((n, b), (0, 0));
     }
 
     #[test]

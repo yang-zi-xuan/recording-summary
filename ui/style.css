@@ -591,5 +591,18 @@ pre {
 /* 建议方向加个前缀标记,让它从两个按钮里突出来 */
 .cloud-sync.suggested::before { content: '建议 '; opacity: .7; }
 
+/* 危险操作的按钮。只用于删除这类不可撤销的动作 ——
+   常规按钮不用这个色,否则红色就失去警示意义了。 */
+.btn.danger {
+  border: 0.0625rem solid #6b2f2f;
+  color: #d97a7a;
+}
+.btn.danger:hover { background: #3a2020; }
+
+/* 工程已删除的历史条目:留着可见但淡掉,且不可点 ——
+   它记录了"这段录音处理过",但已经没有内容可看。 */
+.item.gone { opacity: .55; cursor: default; }
+.item.gone:hover { background: transparent; }
+
 .cloud-kids { display: block; }
 .cloud-kids.collapsed { display: none; }
