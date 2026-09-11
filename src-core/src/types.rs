@@ -134,9 +134,10 @@ pub enum DiarizeMode {
     /// 自动检测人数(省事,长音频容易过分割)
     Auto,
     /// 指定人数(最准)
+    ///
+    /// `1` 是合法的 —— 独白类录音(单人讲课、口述笔记)指定 1 人能得到
+    /// 最干净的结果,不会把同一个人切成几段。
     Fixed(u8),
-    /// 人数范围(折中)
-    Range(u8, u8),
 }
 
 impl DiarizeMode {
@@ -144,7 +145,6 @@ impl DiarizeMode {
         match self {
             DiarizeMode::Auto => "自动检测".to_string(),
             DiarizeMode::Fixed(n) => format!("指定 {n} 人"),
-            DiarizeMode::Range(a, b) => format!("{a}~{b} 人"),
         }
     }
 
@@ -153,7 +153,6 @@ impl DiarizeMode {
         match self {
             DiarizeMode::Auto => None,
             DiarizeMode::Fixed(n) => Some(*n),
-            DiarizeMode::Range(a, _) => Some(*a),
         }
     }
 
@@ -162,7 +161,6 @@ impl DiarizeMode {
         match self {
             DiarizeMode::Auto => "auto".into(),
             DiarizeMode::Fixed(n) => format!("fixed{n}"),
-            DiarizeMode::Range(a, b) => format!("range{a}-{b}"),
         }
     }
 }
@@ -743,7 +741,10 @@ mod tests {
     fn diarize_mode_cluster_count() {
         assert_eq!(DiarizeMode::Auto.explicit_cluster_count(), None);
         assert_eq!(DiarizeMode::Fixed(4).explicit_cluster_count(), Some(4));
-        assert_eq!(DiarizeMode::Range(3, 6).explicit_cluster_count(), Some(3));
+        // 1 人是合法的:独白类录音指定 1 人,避免同一个人被切成几段
+        assert_eq!(DiarizeMode::Fixed(1).explicit_cluster_count(), Some(1));
+        assert_eq!(DiarizeMode::Fixed(1).label(), "指定 1 人");
+        assert_eq!(DiarizeMode::Fixed(1).cache_tag(), "fixed1");
     }
 
     #[test]

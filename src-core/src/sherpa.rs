@@ -72,9 +72,11 @@ pub fn missing_models(models_dir: &Path) -> Vec<PathBuf> {
 /// 表现为"人数总是不对",很难从现象反推。
 pub fn cluster_config(mode: DiarizeMode) -> (Option<i32>, f32) {
     match mode {
+        // None = 走阈值凝聚聚类,人数由算法自己定
         DiarizeMode::Auto => (None, DEFAULT_THRESHOLD),
+        // Some(n) = 精确聚成 n 类。sherpa 的 num_clusters 是**精确值**不是上界,
+        // 所以 n=1 表示"只有一个人",这正是独白录音想要的。
         DiarizeMode::Fixed(n) => (Some(n.max(1) as i32), DEFAULT_THRESHOLD),
-        DiarizeMode::Range(a, _) => (Some(a.max(1) as i32), DEFAULT_THRESHOLD),
     }
 }
 
@@ -258,9 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn range_uses_lower_bound() {
-        assert_eq!(cluster_config(DiarizeMode::Range(3, 7)).0, Some(3));
-        assert_eq!(cluster_config(DiarizeMode::Range(0, 5)).0, Some(1));
+    fn fixed_one_is_allowed() {
+        // ★ 1 人是合法输入 —— 独白类录音(单人讲课、口述笔记)指定 1 人
+        //   能得到最干净的结果,不会把同一个人切成几段。
+        //   sherpa 的 num_clusters 是精确值而不是上界,所以 Some(1) 就是"只有一人"。
+        assert_eq!(cluster_config(DiarizeMode::Fixed(1)).0, Some(1));
+    }
+
+    #[test]
+    fn auto_passes_none_so_sherpa_decides() {
+        // Auto 必须传 None(而不是某个默认数字),否则"自动检测"就变成了固定人数
+        assert_eq!(cluster_config(DiarizeMode::Auto).0, None);
     }
 
     #[test]

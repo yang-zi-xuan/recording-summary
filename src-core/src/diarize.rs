@@ -211,10 +211,6 @@ pub fn cluster(embeddings: &EmbeddingSet, mode: DiarizeMode) -> Result<ClusterRe
             let r = agglomerative(&embeddings.items, 0.62, 2, 8)?;
             Ok(r)
         }
-        DiarizeMode::Range(lo, hi) => {
-            let r = agglomerative(&embeddings.items, 0.62, lo.max(1), hi.max(lo))?;
-            Ok(r)
-        }
     }
 }
 
