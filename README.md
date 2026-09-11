@@ -93,7 +93,7 @@ GUI      Tauri 2.11.5 + WebView2
 ### 1. 构建
 
 ```powershell
-git clone https://github.com/yang-zi-uan/recording-summary.git
+git clone https://github.com/yang-zi-xuan/recording-summary.git
 cd recording-summary
 .\scripts\cargo.ps1 build
 ```
