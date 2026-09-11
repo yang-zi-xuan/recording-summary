@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn keeps_directories_unlike_parse_listing() {
-        let nodes = parse_propfind(SAMPLE, "https://pan.ustc.edu.cn/seafdav/recording-summary", "");
+        let nodes = parse_propfind(SAMPLE, "https://cloud.example.com/seafdav/recording-summary", "");
         // 自身被丢弃,余下 1 文件 + 1 目录
         assert_eq!(nodes.len(), 2, "{nodes:#?}");
         let dir = nodes.iter().find(|n| n.is_dir).expect("应保留目录");
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn parses_size_and_modified() {
-        let nodes = parse_propfind(SAMPLE, "https://pan.ustc.edu.cn/seafdav/recording-summary", "");
+        let nodes = parse_propfind(SAMPLE, "https://cloud.example.com/seafdav/recording-summary", "");
         let f = nodes.iter().find(|n| !n.is_dir).expect("应有文件");
         assert_eq!(f.rel_path, "manifest.json");
         assert_eq!(f.size, Some(4096));
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn drops_the_root_itself() {
-        let nodes = parse_propfind(SAMPLE, "https://pan.ustc.edu.cn/seafdav/recording-summary", "");
+        let nodes = parse_propfind(SAMPLE, "https://cloud.example.com/seafdav/recording-summary", "");
         assert!(
             !nodes.iter().any(|n| n.rel_path.is_empty()),
             "不该把远端根自己列出来"
@@ -823,7 +823,7 @@ mod tests {
 
     #[test]
     fn dirs_sort_before_files() {
-        let nodes = parse_propfind(SAMPLE, "https://pan.ustc.edu.cn/seafdav/recording-summary", "");
+        let nodes = parse_propfind(SAMPLE, "https://cloud.example.com/seafdav/recording-summary", "");
         assert!(nodes[0].is_dir, "目录应排在前面:{nodes:#?}");
     }
 
@@ -891,7 +891,7 @@ mod tests {
             </D:prop></D:propstat>
           </D:response>
         </D:multistatus>"#;
-        let root = "https://pan.ustc.edu.cn/seafdav/recording-summary";
+        let root = "https://cloud.example.com/seafdav/recording-summary";
         let n = parse_propfind(xml, root, "projects");
         assert_eq!(n.len(), 1, "自引用条目应被丢弃:{n:#?}");
         assert_eq!(n[0].rel_path, "projects/工程A");

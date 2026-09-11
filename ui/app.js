@@ -37,6 +37,11 @@ function tauriDialog() {
   return window.__TAURI__ ? window.__TAURI__.dialog : undefined;
 }
 
+function tauriWebview() {
+  const t = window.__TAURI__;
+  return t && t.webview ? t.webview : undefined;
+}
+
 async function invoke(cmd, args) {
   return tauriCore().invoke(cmd, args);
 }
@@ -266,16 +271,104 @@ async function loadHardware() {
 // ---------------------------------------------------------------------------
 
 const dz = $('dropzone');
-['dragenter', 'dragover'].forEach((ev) =>
-  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); })
-);
-['dragleave', 'drop'].forEach((ev) =>
-  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); })
-);
-dz.addEventListener('drop', (e) => {
-  const f = e.dataTransfer.files[0];
-  if (f) setPicked(f.path || f.name);
-});
+
+/** 拖放接入。
+ *
+ *  ⚠️ Tauri 2 的窗口默认 `dragDropEnabled: true`,它在**窗口层拦截**原生
+ *  拖放,所以 HTML5 的 dragenter/dragover/drop **根本不会触发** ——
+ *  之前的实现挂在这些事件上,等于从来没生效过。
+ *
+ *  正确的做法是监听 Tauri 的原生拖放事件
+ *  (`getCurrentWebview().onDragDropEvent()`),它直接给出**文件绝对路径**。
+ *
+ *  顺带修掉另一个错:`dataTransfer.files[0].path` 是 Tauri 1 / Electron 的
+ *  写法,Tauri 2 里不存在(标准 File 对象只有 name,没有 path)。
+ */
+async function setupDragDrop() {
+  const wv = tauriWebview();
+  DRAG_DROP.detail = wv
+    ? typeof wv.getCurrentWebview === 'function'
+      ? '有 webview.getCurrentWebview'
+      : 'webview 存在但没有 getCurrentWebview'
+    : 'window.__TAURI__.webview 不存在';
+
+  if (wv && typeof wv.getCurrentWebview === 'function') {
+    try {
+      await wv.getCurrentWebview().onDragDropEvent((ev) => {
+        const p = ev.payload;
+        DRAG_DROP.events++;
+        DRAG_DROP.lastType = p.type;
+        if (p.type === 'over') {
+          dz.classList.add('over');
+        } else if (p.type === 'drop') {
+          dz.classList.remove('over');
+          const paths = p.paths || [];
+          DRAG_DROP.lastPaths = paths;
+          if (paths.length) setPicked(paths[0]);
+        } else {
+          // leave
+          dz.classList.remove('over');
+        }
+      });
+      DRAG_DROP.mode = 'native';
+      DRAG_DROP.ready = true;
+      return; // 原生事件可用,不必再挂 HTML5 兜底
+    } catch (e) {
+      DRAG_DROP.detail = '注册失败: ' + e;
+      console.warn('[录音转总结] 原生拖放注册失败,退回 HTML5 拖放:', e);
+    }
+  }
+  setupHtml5Drop();
+  DRAG_DROP.mode = 'html5';
+  DRAG_DROP.ready = true;
+}
+
+/** 拖放状态。既用于排查,也通过 window.__DRAG_DROP__ 暴露给 --diag 浮层。 */
+const DRAG_DROP = {
+  mode: '未初始化',
+  ready: false,
+  events: 0,
+  lastType: '',
+  lastPaths: [],
+  detail: '',
+};
+window.__DRAG_DROP__ = DRAG_DROP;
+
+/** HTML5 拖放兜底。
+ *
+ *  只在原生拖放不可用时走到这里。注意此时**拿不到绝对路径**
+ *  (浏览器的 File 对象没有 path),只能提示用户改用「选择文件」。
+ */
+function setupHtml5Drop() {
+  console.warn('[录音转总结] 使用 HTML5 拖放兜底 —— 可能拿不到完整路径');
+  ['dragenter', 'dragover'].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.add('over');
+    })
+  );
+  ['dragleave', 'drop'].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.remove('over');
+    })
+  );
+  dz.addEventListener('drop', (e) => {
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    // Tauri 2 的 File 对象没有 path;能拿到就用,拿不到就让用户走文件对话框
+    if (f.path) {
+      setPicked(f.path);
+    } else {
+      alert(
+        '拖放没能拿到文件的完整路径。\n\n' +
+          '请点「选择文件」按钮挑选音频 —— 这个方式一定能拿到路径。'
+      );
+    }
+  });
+}
+
+setupDragDrop();
 
 $('btnPick').addEventListener('click', async () => {
   const p = await openDialog({
@@ -349,23 +442,48 @@ async function endRun() {
 
 // ---- 事件订阅 ----
 
+// 每个阶段的开始时刻,用于显示"已用多久"。
+// 说话人区分这类阶段可能跑几分钟,只给一个进度条用户还是会怀疑卡死。
+let stageStartedAt = 0;
+
 listen('pipeline://progress', (ev) => {
   const p = ev.payload;
   if (p.kind === 'stage_start') {
     $('progStage').textContent = p.stage + '…';
+    // ★ 进度条与明细必须归零。
+    //
+    //   之前的实现只换了阶段文字,进度条还停在上一阶段的 100% ——
+    //   于是新阶段一开始界面就显示"100% 却不停",看起来像卡死。
+    //   (实测:转写结束后进入说话人区分,用户以为程序挂了。)
+    $('progBar').style.width = '0%';
+    $('progPct').textContent = '';
+    $('progDetail').textContent = '';
+    stageStartedAt = Date.now();
   } else if (p.kind === 'stage_pct') {
     if (p.pct >= 1) {
       $('progPct').textContent = '';
+      $('progDetail').textContent = '';
       logTo($('progLog'), '✓ ' + p.stage, 'ln-ok');
     } else {
-      $('progBar').style.width = Math.round(p.pct * 100) + '%';
+      const pct = Math.max(0, Math.min(1, p.pct));
+      $('progBar').style.width = Math.round(pct * 100) + '%';
+      $('progPct').textContent = Math.round(pct * 100) + '%';
+      // 同时给出已用时间 —— 进度不动时用户至少知道程序还活着
+      const elapsed = Math.round((Date.now() - stageStartedAt) / 1000);
+      $('progDetail').textContent = `${p.stage} 已用 ${fmtClock(elapsed * 1000)}`;
     }
   } else if (p.kind === 'transcribe') {
     const pct = p.total_ms ? p.done_ms / p.total_ms : 0;
     $('progBar').style.width = Math.round(pct * 100) + '%';
     $('progPct').textContent = Math.round(pct * 100) + '%';
+    // 明细里同时给"音频进度"和"已用时间",后者对估算剩余时间更有用
+    const elapsed = Math.round((Date.now() - stageStartedAt) / 1000);
     $('progDetail').textContent =
-      '已处理 ' + fmtClock(p.done_ms) + ' / ' + fmtClock(p.total_ms);
+      '已处理 ' +
+      fmtClock(p.done_ms) +
+      ' / ' +
+      fmtClock(p.total_ms) +
+      `   已用 ${fmtClock(elapsed * 1000)}`;
   } else if (p.kind === 'cache_hit') {
     logTo($('progLog'), '⚡ ' + p.stage + ' 命中缓存', 'ln-ok');
   } else if (p.kind === 'note') {
@@ -682,14 +800,105 @@ $('btnOpenDir').addEventListener('click', async () => {
   if (!currentProject) return;
   try {
     const dir = await invoke('open_project_dir', { id: currentProject.id });
-    const op = window.__TAURI__ && window.__TAURI__.opener;
+    const t = window.__TAURI__;
+    const op = t && t.opener;
+
+    // 优先「在文件管理器中打开」。
+    //
+    // ⚠️ 这两个命令需要 capabilities 里显式授权:
+    //    opener:allow-reveal-item-in-dir / opener:allow-open-path
+    //    插件的 `opener:default` 是**空集**,不给任何命令 —— 之前只写了
+    //    `opener:default`,于是 openPath 被拒,点了没反应。
+    if (op && op.revealItemInDir) {
+      await op.revealItemInDir(dir);
+      return;
+    }
     if (op && op.openPath) {
       await op.openPath(dir);
-    } else {
-      alert('工程目录:\n' + dir);
+      return;
+    }
+    // 插件不可用时至少把路径给出来,别让用户什么都拿不到
+    await copyToClipboard(dir);
+    alert(
+      '已复制工程目录路径(系统打开接口不可用):\n\n' +
+        dir +
+        '\n\n可直接粘到资源管理器地址栏。'
+    );
+  } catch (e) {
+    // 失败时也把路径显示出来 —— 用户至少能自己去找
+    const fallback = currentProject ? currentProject.dir : '';
+    if (fallback) await copyToClipboard(fallback);
+    alert(
+      '打开目录失败:' +
+        e +
+        (fallback ? '\n\n路径已复制到剪贴板:\n' + fallback : '')
+    );
+  }
+});
+
+/** 复制到剪贴板;失败时静默(alert 里已经给了路径)。 */
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 重命名工程。
+ *
+ *  **标题与目录名一起改** —— 只改一个会让界面显示的名字和资源管理器里
+ *  看到的目录长期不一致,反而更难找。
+ *
+ *  改目录名会让云端路径全变,所以成功后要明确提醒用户。
+ */
+$('btnRenameProject').addEventListener('click', async () => {
+  if (!currentProject) return;
+  const oldTitle = currentProject.title;
+  const input = prompt(
+    '新名字:\n\n' +
+      '(标题和文件夹名会一起改。日期前缀会保留。)\n' +
+      '(注意:如果这个工程已经同步过,云端路径会跟着变。)',
+    oldTitle
+  );
+  if (input === null) return; // 取消
+  const title = input.trim();
+  if (!title) {
+    alert('名字不能为空。');
+    return;
+  }
+  if (title === oldTitle) return; // 没变,不折腾
+
+  try {
+    const r = await invoke('rename_project', {
+      id: currentProject.id,
+      title,
+    });
+
+    // 重新拉一次详情,让界面显示新的标题与目录
+    await openProject(currentProject.id);
+
+    if (r.slug_changed) {
+      alert(
+        '已重命名。\n\n' +
+          '标题:' +
+          r.old_title +
+          ' → ' +
+          r.new_title +
+          '\n' +
+          '目录:' +
+          r.old_slug +
+          '\n   → ' +
+          r.dir.split(/[\\/]/).pop() +
+          '\n\n' +
+          '⚠ 目录名变了,云端路径也会变。\n' +
+          '如果这个工程已经同步过,云端旧路径下的文件会变成孤儿 ——\n' +
+          '下次同步会上传新路径;旧路径需要手动清理。'
+      );
     }
   } catch (e) {
-    alert('打开目录失败:' + e);
+    alert('改名失败:' + e);
   }
 });
 
@@ -1484,8 +1693,398 @@ listen('sync://progress', (ev) => {
 });
 
 // ---------------------------------------------------------------------------
-// 设置
+// 云端管理
 // ---------------------------------------------------------------------------
+
+/** 云端树的折叠状态,按 rel_path 记。 */
+const CLOUD = { collapsed: new Set(), mode: '' };
+
+function cloudEsc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/** 渲染云端节点。`depth` 用于缩进。
+ *
+ *  ★ 整行都可点,不只是那个三角。
+ *
+ *  之前只有三角带 `data-cloud-toggle`,点行本身没反应 —— 用户点工程目录
+ *  时以为"点不进去"。三角只有 0.75rem 宽,很难瞄准。
+ *
+ *  另外:已经拉到最深一层时 `children` 为空,但要给「展开」的机会 ——
+ *  所以目录一律显示可展开的三角,展开时若还没有子节点就去懒加载。
+ */
+function cloudNodeHtml(n, depth, loaded) {
+  const pad = 'padding-left:' + (0.375 + depth * 1.1) + 'rem';
+  const isCollapsed = CLOUD.collapsed.has(n.rel_path);
+  const kids = n.children || [];
+  // loaded=false 表示"这一层还没拉过",展开时需要去云端取
+  const canExpand = n.is_dir;
+
+  let caret = '<span class="inv-caret"></span>';
+  if (canExpand) {
+    const sym = isCollapsed ? '▶' : kids.length ? '▼' : '▸';
+    caret = `<span class="inv-caret">${sym}</span>`;
+  }
+
+  const icon = n.is_dir ? '📁' : '📄';
+  const size = n.is_dir ? '' : `<span class="cloud-size">${fmtBytes(n.size || 0)}</span>`;
+  const time = n.modified ? `<span class="cloud-time">${cloudEsc(fmtHttpDate(n.modified))}</span>` : '';
+  const lazy = canExpand && loaded === false ? '1' : '0';
+
+  return `
+    <div class="cloud-row ${n.is_dir ? 'dir' : ''}" style="${pad}"
+         ${n.is_dir ? `data-cloud-dir="${cloudEsc(n.rel_path)}" data-cloud-lazy="${lazy}"` : ''}>
+      ${caret}
+      <span class="cloud-name">${icon} ${cloudEsc(n.name)}</span>
+      ${size}${time}
+      <button class="cloud-del" data-cloud-del="${cloudEsc(n.rel_path)}" data-cloud-isdir="${n.is_dir ? 1 : 0}"
+        title="${n.is_dir ? '删除这个目录及其全部内容' : '删除这个文件'}">删除</button>
+    </div>`;
+}
+
+function cloudTreeHtml(nodes, depth) {
+  let out = '';
+  for (const n of nodes) {
+    const hasKids = n.is_dir && (n.children || []).length > 0;
+    out += cloudNodeHtml(n, depth, hasKids || !n.is_dir);
+    if (hasKids) {
+      const collapsed = CLOUD.collapsed.has(n.rel_path) ? 'collapsed' : '';
+      out += `<div class="cloud-kids ${collapsed}" data-cloud-kids="${cloudEsc(n.rel_path)}">`;
+      out += cloudTreeHtml(n.children, depth + 1);
+      out += '</div>';
+    }
+  }
+  return out;
+}
+
+/** 对照节点:`attention > 0` 的展开显示,其余折叠。 */
+function cloudDiffHtml(nodes, depth) {
+  let out = '';
+  for (const n of nodes) {
+    const pad = 'padding-left:' + (0.375 + depth * 1.1) + 'rem';
+    const kids = n.children || [];
+    const isCollapsed = CLOUD.collapsed.has('D:' + n.rel_path);
+
+    let caret = '<span class="inv-caret"></span>';
+    if (n.is_dir && kids.length) {
+      caret = `<span class="inv-caret">${isCollapsed ? '▶' : '▼'}</span>`;
+    }
+
+    // 徽章:一眼看出这个文件/目录是什么状态
+    let badge = '';
+    if (n.is_dir) {
+      if (n.attention === 0) {
+        badge = '<span class="cloud-badge same">一致</span>';
+      } else {
+        const bits = [];
+        if (n.differing) bits.push(`不同 ${n.differing}`);
+        if (n.local_only) bits.push(`仅本地 ${n.local_only}`);
+        if (n.remote_only) bits.push(`仅云端 ${n.remote_only}`);
+        badge = `<span class="cloud-badge differ">${bits.join(' · ')}</span>`;
+      }
+    } else if (n.status === 'same') {
+      badge = '<span class="cloud-badge same">一致</span>';
+    } else if (n.status === 'differ') {
+      badge = '<span class="cloud-badge differ">大小不同</span>';
+    } else if (n.status === 'local_only') {
+      badge = '<span class="cloud-badge local">仅本地</span>';
+    } else {
+      badge = '<span class="cloud-badge remote">仅云端</span>';
+    }
+
+    const ls = n.local_size != null ? fmtBytes(n.local_size) : '—';
+    const rs = n.remote_size != null ? fmtBytes(n.remote_size) : '—';
+    const sizeTxt = n.is_dir ? '' : `<span class="cloud-size">本地 ${ls} / 云端 ${rs}</span>`;
+
+    // ★ 单文件同步按钮。
+    //
+    // 只在**两边状态不一致**时出现 —— 一致的没什么可同步的,给按钮只是噪音。
+    const syncBtns = n.is_dir ? '' : syncButtonsHtml(n);
+
+    // 只有云端存在的条目才给删除按钮 —— 本地也有的删了会立刻被同步传回来
+    const canDelete = !n.is_dir ? n.status !== 'local_only' : n.remote_only > 0 || n.attention > 0;
+    const del = canDelete
+      ? `<button class="cloud-del" data-cloud-del="${cloudEsc(n.rel_path)}" data-cloud-isdir="${n.is_dir ? 1 : 0}"
+           title="${n.is_dir ? '删除云端这一支' : '删除云端这个文件'}">删除</button>`
+      : '';
+
+    out += `
+      <div class="cloud-row ${n.is_dir ? 'dir' : ''}" style="${pad}"
+           ${n.is_dir ? `data-cloud-dir="D:${cloudEsc(n.rel_path)}" data-cloud-lazy="0"` : ''}>
+        ${caret}
+        <span class="cloud-name">${n.is_dir ? '📁' : '📄'} ${cloudEsc(n.name)}</span>
+        ${sizeTxt}
+        ${badge}
+        ${syncBtns}
+        ${del}
+      </div>`;
+
+    if (n.is_dir && kids.length) {
+      // 需要关注的目录默认展开,一致的收起 —— 用户想看的是有差异的部分
+      const forceOpen = n.attention > 0;
+      const collapsed =
+        !forceOpen && isCollapsed ? 'collapsed' : forceOpen ? '' : CLOUD.collapsed.has('D:' + n.rel_path) ? 'collapsed' : '';
+      out += `<div class="cloud-kids ${collapsed}" data-cloud-kids="D:${cloudEsc(n.rel_path)}">`;
+      out += cloudDiffHtml(kids, depth + 1);
+      out += '</div>';
+    }
+  }
+  return out;
+}
+
+/** HTTP 日期 → 本地短格式。解析不了就原样返回。 */
+function fmtHttpDate(s) {
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 为"两边不一致"的文件生成同步按钮。
+ *
+ *  方向由用户决定 —— 这正是"与本地对照"的核心价值:
+ *  看到差异,然后自己选哪一边赢。
+ *
+ *  但两个按钮平铺会让人犹豫,所以给出一个**建议**:
+ *  大小不同时,较大的那份通常是较新的(编辑一般是在原稿上加东西)。
+ *  这只是启发式而不是事实,所以按钮文字直说"建议",另一个也始终在。
+ */
+function syncButtonsHtml(n) {
+  const rel = cloudEsc(n.rel_path);
+  if (n.status === 'same') return '';
+
+  const onlyLocal = n.status === 'local_only';
+  const onlyRemote = n.status === 'remote_only';
+
+  let suggest = '';
+  if (onlyLocal) {
+    suggest = 'up';
+  } else if (onlyRemote) {
+    suggest = 'down';
+  } else {
+    // 两边都有但大小不同:大的那份更新
+    suggest = (n.local_size || 0) >= (n.remote_size || 0) ? 'up' : 'down';
+  }
+
+  const up = `<button class="cloud-sync up ${suggest === 'up' ? 'suggested' : ''}"
+      data-cloud-sync="${rel}" data-cloud-way="upload"
+      title="把本地这份传上去,覆盖云端">↑ 上传</button>`;
+
+  const down = `<button class="cloud-sync down ${suggest === 'down' ? 'suggested' : ''}"
+      data-cloud-sync="${rel}" data-cloud-way="download"
+      title="把云端这份拉下来,覆盖本地">↓ 下载</button>`;
+
+  // 只有一边有时,另一个方向没有意义 —— 只给能用的那个
+  if (onlyLocal) return up;
+  if (onlyRemote) return down;
+  return up + down;
+}
+
+/** 云端树的展开/折叠与删除,用事件委托 —— 树是重绘的,逐个绑定会丢。
+ *
+ *  ★ 点**整行**都能展开,不是只有那个三角。
+ *    三角只有 0.75rem 宽,瞄不准;而且用户直觉就是"点文件夹进去"。
+ */
+$('cloudTree').addEventListener('click', async (e) => {
+  // 单文件同步 —— 优先级最高,它和删除都在行内
+  const sb = e.target.closest('[data-cloud-sync]');
+  if (sb) {
+    await doSyncOne(sb);
+    return;
+  }
+
+  // 删除按钮
+  const del = e.target.closest('[data-cloud-del]');
+  if (del) {
+    const rel = del.dataset.cloudDel;
+    const isDir = del.dataset.cloudIsdir === '1';
+
+    // ★ 删除不可撤销,确认信息要说清楚删什么
+    const msg = isDir
+      ? `删除云端目录?\n\n${rel}\n\n⚠ 目录里的全部文件和子目录都会一起删掉,不可恢复。`
+      : `删除云端文件?\n\n${rel}\n\n⚠ 不可恢复。`;
+    if (!confirm(msg)) return;
+
+    del.disabled = true;
+    del.textContent = '删除中…';
+    try {
+      const r = await invoke('cloud_delete', { relPath: rel, isDir });
+      let line = '已删除';
+      if (r.files_deleted) line += ` ${r.files_deleted} 个文件`;
+      if (r.dirs_deleted) line += `${r.files_deleted ? '、' : ' '}${r.dirs_deleted} 个目录`;
+      if (r.bytes_deleted) line += `,共 ${fmtBytes(r.bytes_deleted)}`;
+      if (r.failed && r.failed.length) {
+        line += `\n\n有 ${r.failed.length} 项删不掉:\n` + r.failed.slice(0, 8).join('\n');
+      }
+      alert(line);
+      // 重新拉一次,让树反映最新状态
+      await reloadCloud();
+    } catch (err) {
+      alert('删除失败:' + err);
+      del.disabled = false;
+      del.textContent = '删除';
+    }
+    return;
+  }
+
+  // 展开/折叠:整行可点(文件行没有 data-cloud-dir,自然跳过)
+  const row = e.target.closest('[data-cloud-dir]');
+  if (!row) return;
+  await toggleRow(row, row.dataset.cloudDir);
+});
+
+/** 展开或折叠一行。子节点还没拉过时去云端取。 */
+async function toggleRow(row, key) {
+  const tree = $('cloudTree');
+  let kids = tree.querySelector(`[data-cloud-kids="${CSS.escape(key)}"]`);
+
+  if (kids) {
+    kids.classList.toggle('collapsed');
+    const collapsed = kids.classList.contains('collapsed');
+    if (collapsed) CLOUD.collapsed.add(key);
+    else CLOUD.collapsed.delete(key);
+    updateCaret(row, collapsed);
+    return;
+  }
+
+  // 没有子节点容器 —— 说明这一层还没拉过(首屏只拉了有限深度)
+  if (row.dataset.cloudLazy !== '1') {
+    // 拉过了但没有子项 = 空目录,没什么可展开的
+    return;
+  }
+
+  updateCaret(row, false, '…');
+  const rel = key.startsWith('D:') ? key.slice(2) : key;
+  try {
+    // 拉下一层(不递归),插到这一行后面
+    const nodes = await invoke('cloud_tree', { relDir: rel, depth: 1 });
+    const holder = document.createElement('div');
+    holder.className = 'cloud-kids';
+    holder.dataset.cloudKids = key;
+    holder.innerHTML = nodes.length
+      ? cloudTreeHtml(nodes, indentOf(row) + 1)
+      : '<div class="cloud-row" style="opacity:.6"><span class="cloud-name">(空目录)</span></div>';
+    row.after(holder);
+    row.dataset.cloudLazy = '0';
+    CLOUD.collapsed.delete(key);
+    updateCaret(row, false);
+  } catch (err) {
+    updateCaret(row, true);
+    alert('读取这个目录失败:' + err);
+  }
+}
+
+/** 从行的 padding-left 反推它处在第几层。 */
+function indentOf(row) {
+  const m = /padding-left:\s*([\d.]+)rem/.exec(row.getAttribute('style') || '');
+  if (!m) return 0;
+  return Math.max(0, Math.round((parseFloat(m[1]) - 0.375) / 1.1));
+}
+
+/** 更新行首的三角符号。 */
+function updateCaret(row, collapsed, override) {
+  const c = row.querySelector('.inv-caret');
+  if (!c) return;
+  c.textContent = override || (collapsed ? '▶' : '▼');
+}
+
+/** 同步单个文件。
+ *
+ *  ⚠️ 两个方向都会**覆盖**对面那一份,所以先确认。
+ *  确认框里写清方向,免得点错 —— "上传"和"下载"在中文里很容易看反。
+ */
+async function doSyncOne(btn) {
+  const rel = btn.dataset.cloudSync;
+  const way = btn.dataset.cloudWay;
+  const isUp = way === 'upload';
+
+  const msg = isUp
+    ? `把本地这份传上去?\n\n${rel}\n\n⚠ 云端的同名文件会被覆盖。`
+    : `把云端这份拉下来?\n\n${rel}\n\n⚠ 本地的同名文件会被覆盖。`;
+  if (!confirm(msg)) return;
+
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = isUp ? '上传中…' : '下载中…';
+  try {
+    const r = await invoke('cloud_sync_one', { relPath: rel, direction: way });
+    // 重新对照一遍,让状态徽章更新
+    await loadCloudDiff();
+    // 提示放在重绘之后 —— 否则被 innerHTML 冲掉
+    logTo($('syncLog'), '↕ ' + r, 'ln-ok');
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = label;
+    alert((isUp ? '上传失败:' : '下载失败:') + err);
+  }
+}
+
+/** 按当前模式重新拉取云端数据。 */
+async function reloadCloud() {
+  if (CLOUD.mode === 'diff') {
+    await loadCloudDiff();
+  } else if (CLOUD.mode === 'tree') {
+    await loadCloudTree();
+  }
+}
+
+async function loadCloudTree() {
+  const el = $('cloudTree');
+  el.textContent = '读取云端…';
+  try {
+    const nodes = await invoke('cloud_tree', { relDir: null, depth: 3 });
+    CLOUD.mode = 'tree';
+    CLOUD.lastTree = nodes;
+    if (!nodes.length) {
+      el.textContent = '云端还没有任何文件。先跑一次同步。';
+      return;
+    }
+    let files = 0;
+    let bytes = 0;
+    const count = (ns) => {
+      for (const n of ns) {
+        if (n.is_dir) count(n.children || []);
+        else {
+          files++;
+          bytes += n.size || 0;
+        }
+      }
+    };
+    count(nodes);
+    el.innerHTML =
+      `<div class="cloud-row" style="opacity:.75"><span class="cloud-name">共 ${files} 个文件,${fmtBytes(bytes)}</span></div>` +
+      cloudTreeHtml(nodes, 0);
+  } catch (e) {
+    el.textContent = '读取失败:' + e;
+  }
+}
+
+async function loadCloudDiff() {
+  const el = $('cloudTree');
+  el.textContent = '对照中(需要读云端目录,可能要几秒)…';
+  try {
+    const nodes = await invoke('cloud_diff', { depth: 3 });
+    CLOUD.mode = 'diff';
+    CLOUD.lastTree = nodes;
+    if (!nodes.length) {
+      el.textContent = '两边都是空的。';
+      return;
+    }
+    el.innerHTML =
+      '<div class="cloud-row" style="opacity:.75"><span class="cloud-name">' +
+      '状态:<span class="cloud-badge same">一致</span> ' +
+      '<span class="cloud-badge differ">大小不同</span> ' +
+      '<span class="cloud-badge local">仅本地</span> ' +
+      '<span class="cloud-badge remote">仅云端</span>' +
+      '</span></div>' +
+      cloudDiffHtml(nodes, 0);
+  } catch (e) {
+    el.textContent = '对照失败:' + e;
+  }
+}
+
+$('btnCloudTree').addEventListener('click', loadCloudTree);
+$('btnCloudDiff').addEventListener('click', loadCloudDiff);
 
 async function loadSettings() {
   try {
@@ -1644,5 +2243,43 @@ function fatal(msg) {
     await loadHardware();
   } catch (e) {
     fatal(String(e && e.stack ? e.stack : e));
+  }
+
+  // `--diag`:显示运行时诊断浮层。
+  //
+  // 由 Rust 侧在带 --diag 启动时注入 window.__DIAG__ 打开。
+  // 没有 devtools 时这是唯一能看到前端内部状态的办法 ——
+  // 排查"图标不显示""导图不渲染""拖放不生效"都靠它。
+  if (window.__DIAG__) {
+    const box = document.createElement('div');
+    box.id = 'diagBox';
+    box.style.cssText =
+      'position:fixed;right:0;bottom:0;z-index:99999;background:#000d;color:#0f0;' +
+      'font:11px/1.5 monospace;padding:6px 8px;white-space:pre;pointer-events:none;' +
+      'max-width:60vw;border-top-left-radius:6px';
+    document.body.appendChild(box);
+
+    setInterval(() => {
+      const d = window.__DRAG_DROP__ || {};
+      const cs = getComputedStyle(document.documentElement);
+      const rootPx = parseFloat(cs.fontSize);
+      const sb = document.querySelector('.sidebar');
+      const sbW = sb ? sb.getBoundingClientRect().width : 0;
+      // 侧栏宽度 = 14.75rem,所以 sbW/14.75 就是实际生效的根字号。
+      // 与 getComputedStyle 报的值对上,才说明 rem 基准一致。
+      const impliedRoot = sbW > 0 ? (sbW / 14.75).toFixed(2) : '?';
+      const va = parseFloat(getComputedStyle(document.querySelector('.brand-title')).fontSize);
+      box.textContent = [
+        'DIAG',
+        `window=${window.innerWidth}x${window.innerHeight}  dpr=${window.devicePixelRatio}`,
+        `rootFontSize=${rootPx}px   侧栏反推=${impliedRoot}px`,
+        `sidebar=${Math.round(sbW)}px   .brand-title=${va}px`,
+        `html.style.fontSize='${document.documentElement.style.fontSize || "(空)"}'`,
+        `matchMedia(1000px)=${window.matchMedia('(min-width: 1000px)').matches}`,
+        `dragdrop=${d.mode} ready=${d.ready}`,
+        `pickedPath=${S.pickedPath || '(未选)'}`,
+        `mermaid=${window.mermaid ? 'yes' : 'NO'}`,
+      ].join('\n');
+    }, 500);
   }
 })();

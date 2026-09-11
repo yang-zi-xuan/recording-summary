@@ -67,8 +67,8 @@
         <div class="opt">
           <label>语言</label>
           <select id="optLanguage">
-            <option value="">自动检测</option>
-            <option value="zh" selected>中文(自动转简体)</option>
+            <option value="" selected>自动检测</option>
+            <option value="zh">中文(自动转简体)</option>
             <option value="en">英文</option>
             <option value="ja">日文</option>
           </select>
@@ -81,12 +81,17 @@
           <label>说话人数量</label>
           <select id="optSpeakers">
             <option value="">自动检测</option>
+            <option value="1">1 人(独白)</option>
             <option value="2">2 人</option>
             <option value="3">3 人</option>
             <option value="4">4 人</option>
             <option value="5">5 人</option>
             <option value="6">6 人</option>
+            <option value="7">7 人</option>
             <option value="8">8 人</option>
+            <option value="10">10 人</option>
+            <option value="15">15 人</option>
+            <option value="20">20 人</option>
           </select>
         </div>
         <div class="opt wide">
@@ -182,6 +187,7 @@
           <p class="muted" id="projMeta"></p>
         </div>
         <div class="actions">
+          <button class="btn ghost sm" id="btnRenameProject">改名</button>
           <button class="btn ghost sm" id="btnOpenDir">打开目录</button>
         </div>
       </header>
@@ -328,6 +334,23 @@
       <div class="card hidden" id="planCard">
         <h3>同步计划</h3>
         <div id="planList"></div>
+      </div>
+
+      <!-- 云端管理:直接看云端、直接删 -->
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <h3 style="margin:0">云端管理</h3>
+          <div class="actions" style="margin-left:auto">
+            <button class="btn ghost sm" id="btnCloudTree">浏览云端</button>
+            <button class="btn ghost sm" id="btnCloudDiff"
+              title="把云端每个文件和本地对照一遍">与本地对照</button>
+          </div>
+        </div>
+        <p class="muted" style="margin:10px 0 4px">
+          直接查看云端有哪些文件和目录,可以单独删掉某一个。
+          <b>这里删除是立即生效的,不进回收站。</b>
+        </p>
+        <div class="cloud-tree" id="cloudTree">点「浏览云端」或「与本地对照」开始。</div>
       </div>
     </section>
 
