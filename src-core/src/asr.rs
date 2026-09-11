@@ -103,9 +103,36 @@ impl AsrOpts {
     }
 }
 
+/// 转写进度回调。参数是 0.0~1.0 的比例。
+///
+/// **为什么需要它:** 一次转写可能跑几分钟(CPU 上 45 分钟的课尤其明显),
+/// 没有进度的话界面上的进度条会一直停在 0%,直到突然跳到 100% ——
+/// 用户无法判断是"在跑"还是"卡死了"。
+///
+/// 用 `&dyn Fn` 而不是泛型,是为了让 `Transcriber` 保持对象安全
+/// (管线上持有的是 `&dyn Transcriber`)。
+pub type ProgressFn<'a> = &'a (dyn Fn(f32) + Send + Sync);
+
 /// 转写引擎接口。换引擎/换后端都不该影响上层。
 pub trait Transcriber: Send + Sync {
+    /// 转写。
+    ///
+    /// `on_progress` 在转写过程中被调用若干次(不保证频率)。
+    /// 实现方可以忽略它(默认实现就是这么做的),但**不该**依赖它被调用。
     fn transcribe(&self, audio: &PcmAudio, opts: &AsrOpts) -> Result<Transcript>;
+
+    /// 带进度的转写。
+    ///
+    /// 默认实现直接忽略回调 —— 这样简单的引擎(比如测试用的 MockTranscriber)
+    /// 不必都去实现一遍进度上报。
+    fn transcribe_with_progress(
+        &self,
+        audio: &PcmAudio,
+        opts: &AsrOpts,
+        _on_progress: ProgressFn<'_>,
+    ) -> Result<Transcript> {
+        self.transcribe(audio, opts)
+    }
 
     fn name(&self) -> &str;
 }
@@ -222,29 +249,103 @@ impl WhisperCppSidecar {
         a
     }
 
+    /// 跑一次 whisper-cli。
+    ///
+    /// `on_progress` 收到的是 **0.0~1.0 的比例**。它由 whisper-cli 的
+    /// `-pp` 输出解析而来 —— 那些行长这样:
+    ///
+    /// ```text
+    /// whisper_print_progress_callback: progress =  26%
+    /// ```
+    ///
+    /// **必须流式读 stderr。** 早先的实现用 `.output()` 等进程结束才拿到
+    /// stderr,于是进度信息全被攒在最后一起到达 —— 界面上的进度条会一直
+    /// 停在 0%。改成 `spawn` + 逐行读,进度就能实时穿上去。
     fn run_one(
         &self,
         bin: &Path,
         wav: &Path,
         out_prefix: &Path,
         opts: &AsrOpts,
+        on_progress: ProgressFn<'_>,
     ) -> Result<WhisperJson> {
+        use std::io::{BufRead, BufReader};
+
         let args = self.build_args(wav, out_prefix, opts);
         tracing::debug!(?args, "运行 whisper-cli");
 
         // ★ 用 no_window —— 否则每转一段就闪一个黑窗口
-        let out = crate::process::no_window(bin)
+        let mut child = crate::process::no_window(bin)
             .args(&args)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("启动 whisper-cli 失败: {}", bin.display()))?;
 
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let tail: String = err.lines().rev().take(8).collect::<Vec<_>>().join("\n");
+        // 进度经 channel 回传,由**主线程**调用回调。
+        //
+        // 为什么不让读线程直接调 `on_progress`:`ProgressFn` 借的是调用方的
+        // 生命周期,而线程要求 `'static` —— 直接传会编译不过(实测 E0521)。
+        // 走 channel 后线程只发一个 f32,回调在主线程调用,借用关系天然成立。
+        let (tx, rx) = std::sync::mpsc::channel::<f32>();
+
+        // 独自占一个线程读 stderr:一边解析进度一边攒错误信息。
+        // 不这样做的话,stderr 管道写满后子进程会阻塞 —— 那是很难查的死锁。
+        let stderr = child.stderr.take().expect("已设置 piped stderr");
+        let reader = std::thread::spawn(move || {
+            let mut collected = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(p) = parse_progress_percent(&line) {
+                    // 接收端已关闭时忽略错误 —— 说明调用方不再关心进度
+                    let _ = tx.send(p);
+                }
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
+        });
+
+        // stdout 也读掉,避免同样的管道阻塞(whisper-cli 的内容都在文件里,
+        // stdout 只有零散日志,直接丢弃)
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                for _ in BufReader::new(out).lines().map_while(Result::ok) {}
+            });
+        }
+
+        // 等子进程结束,同时把攒下的进度转出去。
+        // 200ms 一轮:对秒级刷新的进度条足够,也不会空转烧 CPU。
+        let status = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(p) => on_progress(p),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // 读线程结束 = stderr 已关闭,子进程也该退出了
+                    break child.wait().context("等待 whisper-cli 结束失败")?;
+                }
+            }
+            if let Some(s) = child.try_wait().context("查询 whisper-cli 状态失败")? {
+                break s;
+            }
+        };
+
+        // 进程结束后把 channel 里剩下的进度全部取出来,避免丢掉最后几个百分比
+        while let Ok(p) = rx.try_recv() {
+            on_progress(p);
+        }
+        let stderr_text = reader.join().unwrap_or_default();
+
+        if !status.success() {
+            let tail: String = stderr_text
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n");
             return Err(anyhow!(
                 "whisper-cli 退出码 {:?}:\n{}",
-                out.status.code(),
+                status.code(),
                 tail
             ));
         }
@@ -259,12 +360,64 @@ impl WhisperCppSidecar {
     }
 }
 
+/// 从 whisper-cli 的一行 stderr 里解析进度百分比。
+///
+/// 实测格式(v1.8.x,`-pp` 打开时):
+///
+/// ```text
+/// whisper_print_progress_callback: progress =  26%
+/// ```
+///
+/// 宽松匹配"含 progress 且以 % 结尾",不硬绑前缀 —— 版本间措辞可能变。
+/// 解析不出来就返回 None(不报错)。
+pub fn parse_progress_percent(line: &str) -> Option<f32> {
+    if !line.contains("progress") {
+        return None;
+    }
+    let pct_pos = line.rfind('%')?;
+    let before = &line[..pct_pos];
+    // 从 % 往前取连续的数字
+    let digits: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let v: f32 = digits.parse().ok()?;
+    Some((v / 100.0).clamp(0.0, 1.0))
+}
+
 impl Transcriber for WhisperCppSidecar {
     fn name(&self) -> &str {
         "whisper.cpp"
     }
 
     fn transcribe(&self, audio: &PcmAudio, opts: &AsrOpts) -> Result<Transcript> {
+        // 无进度的调用:传一个空回调
+        self.transcribe_with_progress(audio, opts, &|_| {})
+    }
+
+    /// 带进度的转写。
+    ///
+    /// 进度按**音频时长**加权聚合,而不是按块数:
+    ///
+    /// ```text
+    /// 整体进度 = (已完成块的时长 + 当前块内进度 × 当前块时长) / 总时长
+    /// ```
+    ///
+    /// 按块数算会在块时长不均时跳变 —— `plan_chunks` 把块边界对齐到静音处,
+    /// 所以块长度本来就不齐。
+    fn transcribe_with_progress(
+        &self,
+        audio: &PcmAudio,
+        opts: &AsrOpts,
+        on_progress: ProgressFn<'_>,
+    ) -> Result<Transcript> {
         if audio.samples.is_empty() {
             return Err(anyhow!("音频为空"));
         }
@@ -283,13 +436,29 @@ impl Transcriber for WhisperCppSidecar {
         let mut all: Vec<Segment> = Vec::new();
         let mut language: Option<String> = None;
 
+        // 已完成块的累计时长,用于算整体进度
+        let mut done_ms: u64 = 0;
+
         for chunk in &chunks {
-            let part = self.transcribe_chunk(&bin, audio, chunk, opts, tmp.path())?;
+            let chunk_ms = chunk.end_ms.saturating_sub(chunk.start_ms);
+            let seg = |p: f32| {
+                let overall = if total > 0 {
+                    (done_ms as f32 + p * chunk_ms as f32) / total as f32
+                } else {
+                    0.0
+                };
+                on_progress(overall.clamp(0.0, 1.0));
+            };
+            let part = self.transcribe_chunk(&bin, audio, chunk, opts, tmp.path(), &seg)?;
             if language.is_none() {
                 language = part.0.clone();
             }
             all.extend(part.1);
+            done_ms += chunk_ms;
         }
+
+        // 收尾:确保最后一次上报是 1.0(块时长的舍入可能让它差一点点)
+        on_progress(1.0);
 
         all.sort_by_key(|s| s.start_ms);
         let raw_text: String = all.iter().map(|s| s.text.as_str()).collect();
@@ -321,13 +490,14 @@ impl WhisperCppSidecar {
         chunk: &Chunk,
         opts: &AsrOpts,
         tmpdir: &Path,
+        on_progress: ProgressFn<'_>,
     ) -> Result<(Option<String>, Vec<Segment>)> {
         let slice = full.slice_ms(chunk.start_ms, chunk.end_ms);
         let wav = tmpdir.join(format!("chunk{:04}.wav", chunk.index));
         audio::encode_wav_16(&wav, &slice)?;
 
         let prefix = tmpdir.join(format!("out{:04}", chunk.index));
-        let json = self.run_one(bin, &wav, &prefix, opts)?;
+        let json = self.run_one(bin, &wav, &prefix, opts, on_progress)?;
 
         let segs: Vec<Segment> = json
             .transcription
@@ -417,6 +587,58 @@ impl Transcriber for MockTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- 进度解析 ----------------------------------------------------------
+
+    #[test]
+    fn parses_real_whisper_progress_lines() {
+        // ★ 这些行是从 whisper-cli v1.8.x 的**实际输出**里抄下来的
+        //   (binaries/cuda/whisper-cli.exe -pp,137 秒音频)
+        let cases = [
+            ("whisper_print_progress_callback: progress =  26%", 0.26),
+            ("whisper_print_progress_callback: progress =  55%", 0.55),
+            ("whisper_print_progress_callback: progress =  83%", 0.83),
+            ("whisper_print_progress_callback: progress = 100%", 1.0),
+            ("whisper_print_progress_callback: progress =   0%", 0.0),
+        ];
+        for (line, want) in cases {
+            let got = parse_progress_percent(line)
+                .unwrap_or_else(|| panic!("应能解析: {line}"));
+            assert!((got - want).abs() < 1e-6, "{line} → {got},期望 {want}");
+        }
+    }
+
+    #[test]
+    fn progress_parser_ignores_other_lines() {
+        // whisper-cli 启动时会打一堆无关日志,不能误判成进度
+        for line in [
+            "ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8187 MiB):",
+            "  Device 0: NVIDIA GeForce RTX 4060 Laptop GPU, compute capability 8.9",
+            "read_audio_data: reading audio data from 'x.wav' ...",
+            "whisper_init_from_file_with_params_no_state: loading model",
+            "",
+            "progress without percent",
+            "100%",
+        ] {
+            assert!(
+                parse_progress_percent(line).is_none(),
+                "不该解析出进度:{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_parser_handles_variant_wording() {
+        // 不硬绑前缀 —— 版本间措辞可能变,只要含 progress 且以 % 结尾就认
+        assert_eq!(parse_progress_percent("progress = 42%"), Some(0.42));
+        assert_eq!(parse_progress_percent("some progress 7%"), Some(0.07));
+    }
+
+    #[test]
+    fn progress_parser_clamps_out_of_range() {
+        // 防御:异常输入不该让进度条跑出 0~1
+        assert_eq!(parse_progress_percent("progress = 150%"), Some(1.0));
+    }
 
     fn tone(ms: u64) -> PcmAudio {
         let n = (16_000u64 * ms / 1000) as usize;

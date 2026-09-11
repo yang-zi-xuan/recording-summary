@@ -133,6 +133,21 @@ impl ProgressSink {
         self.report(Progress::CacheHit(stage));
     }
 
+    /// 转写阶段的音频级进度。
+    ///
+    /// 与 [`Self::stage_pct`] 的区别:那个是"阶段完成了百分之几"(只有 0/1),
+    /// 这个是"**已经处理了多少音频**"。转写是唯一一个耗时长到需要细粒度
+    /// 进度的阶段,所以要单独一条通道。
+    ///
+    /// `done_ms` / `total_ms` 都按**音频时长**算 —— 用户据此能估算剩余时间,
+    /// 比一个百分比有用得多。
+    pub fn transcribe_progress(&self, done_ms: u64, total_ms: u64) {
+        self.report(Progress::Transcribe {
+            audio_ms_done: done_ms.min(total_ms),
+            audio_ms_total: total_ms,
+        });
+    }
+
     /// 取消句柄 —— 由调用方触发(可能来自另一个线程)。
     pub fn canceller(&self) -> Canceller {
         Canceller {
@@ -474,7 +489,22 @@ impl<'a> Pipeline<'a> {
             }
             None => {
                 progress.check_cancelled()?;
-                let t = self.transcriber.transcribe(&pcm, &asr_opts)?;
+                // ★ 把转写进度实时转出去。
+                //
+                // 没有这一步,进度条会在整个转写阶段停在 0% ——
+                // CPU 上跑一节 45 分钟的课是几分钟的静止,用户无法区分
+                // "在跑"和"卡死"。whisper-cli 的 -pp 本来就输出进度,
+                // 这里只是把它接到界面上。
+                let t = self.transcriber.transcribe_with_progress(
+                    &pcm,
+                    &asr_opts,
+                    &|p: f32| {
+                        progress.transcribe_progress(
+                            (p * duration_ms as f32) as u64,
+                            duration_ms,
+                        );
+                    },
+                )?;
                 cache::put_transcript(
                     &self.db,
                     &tkey,
