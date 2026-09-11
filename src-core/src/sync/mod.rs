@@ -31,6 +31,7 @@
 
 pub mod inventory;
 pub mod manifest;
+pub mod remote;
 pub mod selection;
 pub mod state;
 
@@ -175,8 +176,23 @@ impl WebDavConfig {
     }
 
     /// 拼一个远端文件的完整 URL。
+    ///
+    /// # 必须做百分号编码
+    ///
+    /// 之前是直接 `format!("{}/{}", root, rel_path)`,路径原样拼进去。
+    /// 后果(实测于真实 Seafile):
+    ///
+    /// - 含**空格**时侥幸能过 —— reqwest 会把 URL 里的空格自动编码成 `%20`。
+    /// - 含**中文**时失败 —— 尤其是 MOVE 的 `Destination` 头,
+    ///   那是请求头而不是 URL,reqwest **不会**替我们编码,
+    ///   服务器收到原始 UTF-8 字节后解析出错误的路径,返回 409。
+    ///
+    /// 症状是"父目录不存在(409)",但目录其实是好的 ——
+    /// 真正的错因被那句提示掩盖了,查起来很绕。
+    ///
+    /// 所以在这里一次性编码好,所有调用点(含 `Destination` 头)都受益。
     pub fn url_for(&self, rel_path: &str) -> String {
-        format!("{}/{}", self.root(), rel_path.trim_start_matches('/'))
+        format!("{}/{}", self.root(), encode_path(rel_path.trim_start_matches('/')))
     }
 }
 
@@ -494,6 +510,53 @@ impl WebDavClient {
         Ok(parse_listing(&text, &self.cfg.root()))
     }
 
+    /// 列目录,**保留目录条目**并带上大小与修改时间。
+    ///
+    /// 与 [`Self::list`] 的区别:`list` 只关心文件(同步引擎用),
+    /// 这个给界面浏览云端用 —— 要看到有哪些工程目录。
+    ///
+    /// `rel_dir` 为空表示远端根。
+    pub async fn list_nodes(&self, rel_dir: &str) -> Result<Vec<remote::RemoteNode>> {
+        let url = if rel_dir.trim_matches('/').is_empty() {
+            self.cfg.root()
+        } else {
+            self.cfg.url_for(rel_dir)
+        };
+        let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:"><D:prop><D:getetag/><D:resourcetype/><D:getcontentlength/><D:getlastmodified/></D:prop></D:propfind>"#;
+
+        let resp = self
+            .send_retry(|| {
+                self.http
+                    .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+                    .header("Depth", "1")
+                    .header("Content-Type", "application/xml; charset=utf-8")
+                    .body(body)
+            })
+            .await?;
+
+        let code = resp.status().as_u16();
+        // 目录不存在视为空 —— 界面第一次打开时远端可能还没有这个目录
+        if code == 404 {
+            return Ok(vec![]);
+        }
+        if code != 207 && code != 200 {
+            return Err(anyhow!(self.explain(code, &url)));
+        }
+        let text = resp.text().await.unwrap_or_default();
+        // ⚠️ 必须把"本次所查目录"传进去。
+        //
+        // Seafile 的 PROPFIND 会把**所查目录本身**也放进响应里。
+        // 老的 parse_listing 丢弃目录所以不受影响,而这里保留目录 ——
+        // 不过滤的话每展开一层都会多出一个指向自己的条目,点进去是空的
+        // (实测就是这个现象:工程目录里又出现一个同名目录)。
+        Ok(remote::parse_propfind(
+            &text,
+            &self.cfg.root(),
+            rel_dir.trim_matches('/'),
+        ))
+    }
+
     /// 连通性测试(设置页的"测试连接")。
     pub async fn test_connection(&self) -> Result<String> {
         self.cfg.validate()?;
@@ -662,16 +725,37 @@ pub fn parse_listing(xml: &str, root: &str) -> Vec<(String, Option<String>)> {
     out
 }
 
+/// 对 WebDAV 路径做百分号编码,**保留 `/` 作为层级分隔**。
+///
+/// 规则:
+/// - 未保留字符(`A-Z a-z 0-9 - . _ ~`)原样保留
+/// - `/` 原样保留(它分隔路径段,不能编码)
+/// - 其余字节按 UTF-8 逐字节编成 `%XX`
+///
+/// 与 `urlencoding::encode` 的区别就是那个 `/` —— 那个函数会把
+/// 斜杠也编成 `%2F`,整条路径就变成一个巨长的文件名了。
+pub(crate) fn encode_path(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for b in p.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// 去掉 XML 命名空间前缀,只保留本地名。
-fn local_name(qname: &[u8]) -> &[u8] {
-    match qname.iter().rposition(|b| *b == b':') {
+pub(crate) fn local_name(qname: &[u8]) -> &[u8] {    match qname.iter().rposition(|b| *b == b':') {
         Some(i) => &qname[i + 1..],
         None => qname,
     }
 }
 
 /// 把完整 href 转成相对 root 的路径。
-fn href_to_rel(href: &str, root: &str) -> Option<String> {
+pub(crate) fn href_to_rel(href: &str, root: &str) -> Option<String> {
     // href 可能是完整 URL 或绝对路径;取路径部分
     let path = if let Some(idx) = href.find("://") {
         let after = &href[idx + 3..];
@@ -1092,11 +1176,35 @@ impl<'a> Syncer<'a> {
         let total = plan.len();
         let mut report = SyncReport::default();
 
+        // ★ 本机同步状态。
+        //
+        // 这份状态是**界面显示"已同步/从未同步"的唯一依据**
+        // (见 state::status_of),它和 manifest 是两件事:
+        //
+        //   manifest   —— 云端有哪些文件(会同步给别的设备)
+        //   sync-state —— 本机传过哪些文件、什么时候传的(只在本机)
+        //
+        // ⚠️ 之前这里漏了保存:`save_state` 写好了却没人调,
+        //    所以 sync-state.json 从来不生成,清单里所有文件**永远显示
+        //    "从未同步"** —— 哪怕 manifest 里明明有记录。
+        //    这和 ensure_dir 那次是同一类错误:死代码不报错,
+        //    测试也照不出来,只有真跑一遍才看得见。
+        let mut sync_state = self.load_state();
+
         for (i, item) in plan.iter().enumerate() {
             progress(&item.rel_path, i + 1, total);
             match item.action {
                 Action::Skip => {
                     report.skipped += 1;
+                    // 已经是同步状态。若本机状态表里没有这条(比如从没存过),
+                    // 补一条 —— 否则界面上会显示成"从未同步",与事实不符。
+                    if sync_state.get(&item.rel_path).is_none() {
+                        sync_state.mark_synced(
+                            &item.rel_path,
+                            item.remote_etag.clone(),
+                            Some(item.local_size),
+                        );
+                    }
                 }
                 Action::Upload => {
                     let abs = self.files.root().join(&item.rel_path);
@@ -1113,6 +1221,8 @@ impl<'a> Syncer<'a> {
                                         .block_on(self.client.head_etag(&item.rel_path))
                                         .ok()
                                         .flatten();
+                                    // 先记本机状态(要借用 etag),再写 manifest(会取走它)
+                                    sync_state.mark_synced(&item.rel_path, etag.clone(), Some(n));
                                     manifest.record(
                                         &item.rel_path,
                                         ManifestEntry {
@@ -1155,6 +1265,11 @@ impl<'a> Syncer<'a> {
                                             deleted_at: None,
                                         },
                                     );
+                                    sync_state.mark_synced(
+                                        &item.rel_path,
+                                        item.remote_etag.clone(),
+                                        Some(data.len() as u64),
+                                    );
                                 }
                                 Err(e) => report
                                     .failed
@@ -1173,12 +1288,15 @@ impl<'a> Syncer<'a> {
                         Ok(()) => {
                             report.deleted += 1;
                             manifest.record_tombstone(&item.rel_path, &self.device_id);
+                            // 云端那份没了,本机状态也要跟着反映
+                            sync_state.mark_local_deleted(&item.rel_path);
                         }
                         Err(e) => {
                             // 404 也算成功 —— 目标状态已达成
                             if e.to_string().contains("404") {
                                 report.deleted += 1;
                                 manifest.record_tombstone(&item.rel_path, &self.device_id);
+                                sync_state.mark_local_deleted(&item.rel_path);
                             } else {
                                 report
                                     .failed
@@ -1196,6 +1314,15 @@ impl<'a> Syncer<'a> {
             .block_on(self.client.put_atomic(manifest::MANIFEST_REMOTE_PATH, &bytes))?;
         // 本地也落一份,便于排查
         manifest.save(&self.files.manifest_path())?;
+
+        // ★ 保存本机同步状态。界面上的"已同步/从未同步"就靠它。
+        //
+        // 保存失败**不该让整次同步算失败** —— 文件已经传上去了,
+        // 状态表丢了最多是界面显示不准,重新同步一次就补回来。
+        // 所以这里只记日志,不返回错误。
+        if let Err(e) = self.save_state(&sync_state) {
+            tracing::warn!("保存 sync-state 失败(界面状态可能显示不准): {e}");
+        }
 
         Ok(report)
     }
@@ -1657,6 +1784,80 @@ mod tests {
         assert_eq!(percent_decode("no-encoding"), "no-encoding");
         // 非法序列不应 panic
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    // --- 路径百分号编码 ----------------------------------------------------
+
+    #[test]
+    fn encode_path_keeps_slashes_and_unreserved() {
+        // ★ 斜杠必须保留 —— 编码成 %2F 会把整条路径变成一个文件名
+        assert_eq!(encode_path("a/b/c.txt"), "a/b/c.txt");
+        assert_eq!(encode_path("AZaz09-._~"), "AZaz09-._~");
+    }
+
+    #[test]
+    fn encode_path_encodes_space_and_chinese() {
+        // 空格:reqwest 会替 URL 自动编码,但不会替请求头(Destination)编码
+        assert_eq!(encode_path("a b"), "a%20b");
+        // 中文:逐字节 UTF-8 编码
+        assert_eq!(encode_path("中文"), "%E4%B8%AD%E6%96%87");
+        // 组合:真实工程目录名的形状。
+        // 注意日期里的 `9` 是数字,不编码 —— 我第一版期望值把它漏了,
+        // 是测试写错而不是实现错(用 PowerShell 独立算过逐字节一致)。
+        assert_eq!(
+            encode_path("projects/2026-09-11_9月11日 计算机视觉/x.md"),
+            "projects/2026-09-11_9%E6%9C%8811%E6%97%A5%20%E8%AE%A1%E7%AE%97%E6%9C%BA%E8%A7%86%E8%A7%89/x.md"
+        );
+    }
+
+    #[test]
+    fn encode_path_escapes_reserved_chars() {
+        // 这些字符在 URL 里有特殊含义,必须编码
+        assert_eq!(encode_path("a?b"), "a%3Fb");
+        assert_eq!(encode_path("a#b"), "a%23b");
+        assert_eq!(encode_path("a%20b"), "a%2520b"); // % 自身也要编码
+        assert_eq!(encode_path("a+b"), "a%2Bb");
+    }
+
+    #[test]
+    fn url_for_round_trips_through_decode() {
+        // 编码后再解码应还原 —— 这是编码正确性的核心保证
+        let cases = [
+            "projects/2026-09-11_9月11日 计算机视觉/transcript.md",
+            "audio/recording.m4a",
+            "中文目录/deep/hello.txt",
+            "a b/c d.md",
+        ];
+        for c in cases {
+            assert_eq!(percent_decode(&encode_path(c)), c, "往返失败: {c}");
+        }
+    }
+
+    #[test]
+    fn url_for_encodes_the_relative_part_only() {
+        let cfg = WebDavConfig {
+            base_url: "https://cloud.example.com/webdav".into(),
+            remote_dir: "recording-summary".into(),
+            ..Default::default()
+        };
+        let u = cfg.url_for("projects/中文 目录/a.md");
+        // 服务地址部分保持原样,只有相对路径被编码
+        assert!(u.starts_with("https://cloud.example.com/webdav/recording-summary/"), "{u}");
+        assert!(u.ends_with("projects/%E4%B8%AD%E6%96%87%20%E7%9B%AE%E5%BD%95/a.md"), "{u}");
+        assert!(!u.contains(' '), "URL 里不该有原始空格: {u}");
+    }
+
+    #[test]
+    fn url_for_leaves_ascii_paths_unchanged() {
+        let cfg = WebDavConfig {
+            base_url: "https://cloud.example.com/webdav".into(),
+            remote_dir: "recording-summary".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.url_for("transcript/ab/ab3f.json"),
+            "https://cloud.example.com/webdav/recording-summary/transcript/ab/ab3f.json"
+        );
     }
 
     #[test]

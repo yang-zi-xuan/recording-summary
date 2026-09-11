@@ -361,6 +361,63 @@ mod tests {
 
     // --- 状态判定 ----------------------------------------------------------
 
+    /// ★ 回归测试:状态表必须能**落盘再读回**。
+    ///
+    /// 之前的 bug 不在读写本身,而在 `run()` 从来没调用 `save_state` ——
+    /// 于是 sync-state.json 永远不存在,界面把所有文件都显示成
+    /// "从未同步",哪怕 manifest 里明明有记录。
+    ///
+    /// 这个测试保证"存了能读回"这一半;另一半(run 里要调用 save_state)
+    /// 只能在真实同步里验证,所以我在 `run()` 的 Skip 分支也补了记录 ——
+    /// 这样即使状态表丢了,下次同步也能自愈。
+    #[test]
+    fn state_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = SyncState::path_in(dir.path());
+
+        let mut s = SyncState::new();
+        s.mark_synced("a/b.txt", Some("\"etag1\"".into()), Some(123));
+        s.mark_synced("中文 目录/c.md", Some("\"etag2\"".into()), Some(456));
+        s.save(&p).unwrap();
+
+        assert!(p.is_file(), "save 之后文件应存在:{}", p.display());
+        let back = SyncState::load(&p);
+        assert_eq!(back.files.len(), 2);
+
+        let a = back.get("a/b.txt").expect("a/b.txt 应读回");
+        assert_eq!(a.etag.as_deref(), Some("\"etag1\""));
+        assert_eq!(a.size, Some(123));
+        assert!(a.last_synced_at.is_some(), "★ 这一项决定界面显示'已同步'");
+
+        // 中文路径也要能往返 —— store 里的路径本来就含中文工程名
+        let c = back.get("中文 目录/c.md").expect("中文路径应读回");
+        assert_eq!(c.size, Some(456));
+    }
+
+    #[test]
+    fn state_file_is_created_under_store_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            SyncState::path_in(dir.path()),
+            dir.path().join("sync-state.json")
+        );
+    }
+
+    #[test]
+    fn mark_synced_sets_the_field_that_decides_display() {
+        // status_of 靠 last_synced_at 判"是否同步过"
+        let mut s = SyncState::new();
+        assert_eq!(
+            s.status_of("x", true, Some(10), None, true),
+            SyncStatus::NeverSynced
+        );
+        s.mark_synced("x", None, Some(10));
+        assert_eq!(
+            s.status_of("x", true, Some(10), None, true),
+            SyncStatus::Synced
+        );
+    }
+
     #[test]
     fn excluded_wins_over_everything() {
         // ★ 用户主动排除的文件,不管别的条件如何,都显示"未同步"
