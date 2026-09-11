@@ -185,7 +185,13 @@ enum SyncAction {
         dir: String,
     },
     /// 显示当前同步配置
-    Show,
+    Show {
+        /// 以 `KEY=VALUE` 形式输出,便于喂给诊断程序。
+        ///
+        /// ⚠️ **会打印明文密码。** 只在你明确要看的时候用。
+        #[arg(long)]
+        env: bool,
+    },
     /// 测试连通性
     Test,
     /// 计算同步计划(不实际传输)
@@ -270,6 +276,13 @@ enum ProjectAction {
         id: String,
         /// 目标目录(不存在则创建)
         dest: PathBuf,
+    },
+    /// 重命名工程(标题与目录名一起改)
+    Rename {
+        /// 工程 ID(或前缀)
+        id: String,
+        /// 新标题
+        title: String,
     },
 }
 
@@ -1041,6 +1054,31 @@ fn cmd_projects(data_dir: &std::path::Path, action: Option<ProjectAction>) -> Re
             println!();
             println!("这个目录是自包含的 —— 可以直接打包发给别人。");
         }
+
+        ProjectAction::Rename { id, title } => {
+            let p = store
+                .find(&id)?
+                .ok_or_else(|| anyhow::anyhow!("找不到工程: {id}"))?;
+            let old_title = p.meta.title.clone();
+            let old_dir = p.dir.clone();
+
+            let out = store.rename(&id, &title)?;
+
+            println!("✅ 已重命名");
+            println!("   标题: {old_title} → {}", store.find(&id)?.unwrap().meta.title);
+            if out.slug_changed {
+                println!("   目录: {}", old_dir.display());
+                println!("      → {}", out.dir.display());
+                println!();
+                // ★ 必须提醒:目录名变了 = 云端路径全变
+                println!("⚠ 目录名变了,云端的路径也跟着变。");
+                println!("   如果这个工程已经同步过,云端旧路径下的文件会变成孤儿。");
+                println!("   下次 `rs sync run` 会把新路径传上去;旧路径需要手动清理");
+                println!("   (或等同步的删除策略处理 —— 但那只对在范围内的文件生效)。");
+            } else {
+                println!("   (目录名未变,只有标题更新了)");
+            }
+        }
     }
     Ok(())
 }
@@ -1222,8 +1260,17 @@ fn cmd_sync(data_dir: &std::path::Path, action: SyncAction) -> Result<()> {
             println!("下一步:rs sync test");
         }
 
-        SyncAction::Show => {
+        SyncAction::Show { env } => {
             let cfg = webdav_config_from_db(&db)?;
+            if env {
+                // 给诊断程序用。故意不做任何美化 —— 便于 `| Invoke-Expression`
+                // 或 `for /f` 直接消费。
+                println!("DIAG_URL={}", cfg.base_url);
+                println!("DIAG_USER={}", cfg.username);
+                println!("DIAG_PASS={}", cfg.password);
+                println!("DIAG_DIR={}", cfg.remote_dir);
+                return Ok(());
+            }
             println!("服务地址   : {}", cfg.base_url);
             println!("远端目录   : {}", cfg.remote_dir);
             println!("上传目标   : {}", cfg.root());
@@ -1240,6 +1287,7 @@ fn cmd_sync(data_dir: &std::path::Path, action: SyncAction) -> Result<()> {
             println!("本地目录   : {}", files.root().display());
             println!();
             println!("注意:音频是否走 WebDAV 取决于 `--audio`(默认参与)。见 `rs sync plan`。");
+            println!("     要看明文密码(诊断用)加 `--env`。");
         }
 
         SyncAction::Test => {

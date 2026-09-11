@@ -1296,6 +1296,262 @@ fn clear_sync_excludes(state: State<AppState>) -> Result<SyncSelectionDto, Strin
 /// 同步清单树。
 ///
 /// `probe` 为 true 时会联网为每个文件发 HEAD 请求确认远端状态 ——
+/// 列云端目录树(带大小与修改时间)。
+///
+/// `rel_dir` 空 = 远端根。`depth` 限制递归层数 —— 界面首屏只拉一两层,
+/// 展开某个目录时再拉它的下一层。
+#[tauri::command]
+async fn cloud_tree(
+    state: State<'_, AppState>,
+    rel_dir: Option<String>,
+    depth: Option<usize>,
+) -> Result<Vec<sync::remote::RemoteNode>, String> {
+    let db = state.db().map_err(err_str)?;
+    let cfg = webdav_config(&db).map_err(err_str)?;
+    if cfg.username.is_empty() || cfg.password.is_empty() {
+        return Err("还没配置 WebDAV 账号。请先在「云端同步」里填好账号密码。".into());
+    }
+    let dir = rel_dir.unwrap_or_default();
+    // 上限 4 层:工程结构是 工程/分组/文件,再多说明远端结构异常
+    let d = depth.unwrap_or(2).clamp(1, sync::remote::MAX_TREE_DEPTH);
+
+    let client = sync::WebDavClient::new(cfg).map_err(err_str)?;
+    sync::remote::fetch_tree(&client, &dir, d)
+        .await
+        .map_err(err_str)
+}
+
+/// 本地 ↔ 云端 差异对照。
+///
+/// 返回的树里每个目录都带 `attention`(需要关注的文件数)与
+/// `differing` / `local_only` / `remote_only` 三个分类计数,
+/// 界面据此决定展开哪一支默认高亮。
+#[tauri::command]
+async fn cloud_diff(
+    state: State<'_, AppState>,
+    depth: Option<usize>,
+) -> Result<Vec<sync::remote::DiffNode>, String> {
+    let db = state.db().map_err(err_str)?;
+    let files = state.files().map_err(err_str)?;
+    let cfg = webdav_config(&db).map_err(err_str)?;
+    if cfg.username.is_empty() || cfg.password.is_empty() {
+        return Err("还没配置 WebDAV 账号。请先在「云端同步」里填好账号密码。".into());
+    }
+    let d = depth.unwrap_or(3).clamp(1, sync::remote::MAX_TREE_DEPTH);
+
+    // 本地文件表:rel_path → (大小, 内容哈希)
+    let local = local_file_index(&files).map_err(err_str)?;
+
+    let client = sync::WebDavClient::new(cfg).map_err(err_str)?;
+    sync::remote::fetch_diff(&client, &local, d)
+        .await
+        .map_err(err_str)
+}
+
+/// 遍历本地存储目录,产出 `rel_path → (size, hash)`。
+///
+/// # 只收"同步引擎会传的文件"
+///
+/// 不是简单地全盘遍历 —— store 根下还有两个**本机专用**文件:
+///
+/// - `device.id`      本机标识,同步它会让两台机器互相覆盖
+/// - `sync-state.json` 本机同步状态,设计上就不同步
+///
+/// 它们永远不会出现在云端。若算进对照里,界面会一直显示"仅本地 2",
+/// 看起来像有问题,其实是正常的。同步引擎那边的
+/// [`rs_core::store::files::FileStore::list_sync_files`] 只遍历
+/// `transcript`/`summary`/`speaker_labels` 三个子目录,天然避开了它们 ——
+/// 这里保持一致。
+///
+/// `manifest.json` 是要同步的(它在远端存在),所以放在白名单里。
+fn local_file_index(
+    files: &rs_core::store::files::FileStore,
+) -> anyhow::Result<std::collections::BTreeMap<String, (u64, Option<String>)>> {
+    let root = files.root();
+    let mut out = std::collections::BTreeMap::new();
+
+    // 与同步引擎一致:三个内容目录 + 工程目录 + manifest
+    let include_audio = true; // 对照时音频也要看 —— 用户想知道它传上去没有
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+
+    for sub in ["transcript", "summary", "speaker_labels"] {
+        let p = root.join(sub);
+        if !p.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&p).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_file() {
+                targets.push(entry.path().to_path_buf());
+            }
+        }
+    }
+
+    let projects = root.join("projects");
+    if projects.is_dir() {
+        for entry in walkdir::WalkDir::new(&projects)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if !include_audio
+                && entry
+                    .path()
+                    .components()
+                    .any(|c| c.as_os_str() == rs_core::project::AUDIO_DIR)
+            {
+                continue;
+            }
+            targets.push(entry.path().to_path_buf());
+        }
+    }
+
+    // manifest 在远端确实有,算进来
+    let mf = files.manifest_path();
+    if mf.is_file() {
+        targets.push(mf);
+    }
+
+    for p in targets {
+        let name = p.file_name().map(|s| s.to_string_lossy().to_string());
+        // 跳过临时文件
+        if let Some(n) = &name {
+            if n.ends_with(".tmp") || n.ends_with(".part") || n.starts_with('.') {
+                continue;
+            }
+        }
+        let Ok(rel) = p.strip_prefix(root) else { continue };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        out.insert(rel, (size, None));
+    }
+
+    Ok(out)
+}
+
+/// 删除云端的文件或目录(递归)。
+///
+/// 这是**用户主动发起**的操作,不写墓碑、不查删除策略 —— 见
+/// [`sync::remote`] 的模块文档。界面上必须先让用户确认。
+#[tauri::command]
+async fn cloud_delete(
+    state: State<'_, AppState>,
+    rel_path: String,
+    is_dir: bool,
+) -> Result<sync::remote::DeleteReport, String> {
+    let db = state.db().map_err(err_str)?;
+    let cfg = webdav_config(&db).map_err(err_str)?;
+    if cfg.username.is_empty() || cfg.password.is_empty() {
+        return Err("还没配置 WebDAV 账号。".into());
+    }
+    let node = sync::remote::RemoteNode {
+        name: rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string(),
+        rel_path: rel_path.clone(),
+        is_dir,
+        size: None,
+        modified: None,
+        etag: None,
+        children: Vec::new(),
+    };
+    let client = sync::WebDavClient::new(cfg).map_err(err_str)?;
+    sync::remote::delete_node(&client, &node)
+        .await
+        .map_err(err_str)
+}
+
+/// 单个文件的同步方向。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OneWay {
+    /// 本地 → 云端
+    Upload,
+    /// 云端 → 本地
+    Download,
+}
+
+/// 单独同步**一个文件**(不走同步引擎、不写清单)。
+///
+/// # 与 `run_sync` 的分工
+///
+/// `run_sync` 按规则整批跑;这个针对用户在对照视图里挑中的某一个文件。
+/// 典型场景:看到某个文件"大小不同",想立刻把本地这版推上去。
+///
+/// # 为什么不写 manifest / sync-state
+///
+/// 保持"手动"与"自动"两条路径分离。手动传完的文件在下一次 `run_sync` 时
+/// 会因为 manifest 里没有记录而被判定为"需要上传" —— 那时再传一次即可,
+/// 内容一致所以代价只是多一次请求。
+///
+/// 反过来(手动操作去改 manifest)危险得多:manifest 是跨设备的合并依据,
+/// 手写它可能让别的设备误判。
+#[tauri::command]
+async fn cloud_sync_one(
+    state: State<'_, AppState>,
+    rel_path: String,
+    direction: OneWay,
+) -> Result<String, String> {
+    let db = state.db().map_err(err_str)?;
+    let files = state.files().map_err(err_str)?;
+    let cfg = webdav_config(&db).map_err(err_str)?;
+    if cfg.username.is_empty() || cfg.password.is_empty() {
+        return Err("还没配置 WebDAV 账号。".into());
+    }
+    let root = files.root().to_path_buf();
+    let client = sync::WebDavClient::new(cfg).map_err(err_str)?;
+
+    match direction {
+        OneWay::Upload => {
+            // 防目录穿越:rel_path 来自界面,不该含 .. 或绝对路径
+            let abs = safe_join(&root, &rel_path)?;
+            if !abs.is_file() {
+                return Err(format!("本地文件不存在:{}", abs.display()));
+            }
+            let n = sync::remote::upload_one(&client, &abs, &rel_path)
+                .await
+                .map_err(err_str)?;
+            Ok(format!("已上传 {rel_path}({n} 字节)"))
+        }
+        OneWay::Download => {
+            let abs = safe_join(&root, &rel_path)?;
+            match sync::remote::download_one(&client, &rel_path, &abs)
+                .await
+                .map_err(err_str)?
+            {
+                Some(n) => Ok(format!("已下载 {rel_path}({n} 字节)")),
+                None => Err(format!("云端没有这个文件:{rel_path}")),
+            }
+        }
+    }
+}
+
+/// 把相对路径安全地拼到 root 下。
+///
+/// 拒绝绝对路径与 `..` —— 这个路径来自界面,虽然是自己人用,
+/// 但"绝不信任来自前端的路径"是条便宜的规矩。
+fn safe_join(root: &std::path::Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        return Err("路径为空".into());
+    }
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return Err(format!("不接受绝对路径:{rel}"));
+    }
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                return Err(format!("路径不能包含 ..:{rel}"));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!("路径不合法:{rel}"));
+            }
+            _ => {}
+        }
+    }
+    Ok(root.join(p))
+}
+
 /// 准确但慢(上百个文件可能十几秒)。界面首屏传 false 秒开,
 /// 用户点「核实云端状态」时再传 true。
 #[tauri::command]
@@ -1603,6 +1859,56 @@ fn open_project_dir(state: State<AppState>, id: String) -> Result<String, String
     Ok(p.dir.to_string_lossy().to_string())
 }
 
+/// 工程重命名的结果。前端据此提示"云端路径已变"。
+#[derive(serde::Serialize)]
+struct RenameProjectResult {
+    /// 改名后的目录
+    dir: String,
+    /// 原标题
+    old_title: String,
+    /// 新标题
+    new_title: String,
+    /// 目录名是否真的变了(= 云端路径变了)
+    slug_changed: bool,
+    /// 旧目录名
+    old_slug: String,
+}
+
+/// 重命名工程:标题与目录名一起改。
+///
+/// **不改工程 ID** —— ID 是音频内容哈希,与名字无关。所以改名之后
+/// 转写缓存、声纹标签、同步清单里按 ID 索引的东西全部照旧。
+#[tauri::command]
+fn rename_project(
+    state: State<AppState>,
+    id: String,
+    title: String,
+) -> Result<RenameProjectResult, String> {
+    use rs_core::project::ProjectStore;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("新标题不能为空".into());
+    }
+    let files = state.files().map_err(err_str)?;
+    let store = ProjectStore::new(files.root());
+    let old_title = store
+        .find(&id)
+        .map_err(err_str)?
+        .ok_or_else(|| format!("找不到工程: {id}"))?
+        .meta
+        .title
+        .clone();
+
+    let out = store.rename(&id, &title).map_err(err_str)?;
+    Ok(RenameProjectResult {
+        dir: out.dir.to_string_lossy().to_string(),
+        old_title,
+        new_title: title,
+        slug_changed: out.slug_changed,
+        old_slug: out.old_slug,
+    })
+}
+
 /// 把导图源码写盘(PNG 由前端截图后回传,见 save_png)。
 #[tauri::command]
 fn save_mermaid_source(state: State<AppState>, id: String, source: String) -> Result<String, String> {
@@ -1681,7 +1987,75 @@ mod base64_decode {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_decode;
+    use super::{base64_decode, safe_join};
+
+    // --- 路径安全 ----------------------------------------------------------
+    //
+    // `rel_path` 来自界面。虽然是自用软件,但"绝不信任来自前端的路径"
+    // 是一条几乎零成本的规矩 —— 一旦哪天界面出了 bug 或被注入,
+    // 单文件同步/删除就可能写到 store 之外。
+
+    #[test]
+    fn safe_join_accepts_normal_relative_paths() {
+        let root = std::path::Path::new("D:\\store");
+        assert_eq!(
+            safe_join(root, "projects/P/transcript.md").unwrap(),
+            root.join("projects/P/transcript.md")
+        );
+        // 前导斜杠会被去掉,不当作绝对路径
+        assert_eq!(
+            safe_join(root, "/projects/P/x.md").unwrap(),
+            root.join("projects/P/x.md")
+        );
+        // 中文与空格
+        assert_eq!(
+            safe_join(root, "projects/2026-09-11_9月11日 计算机视觉/a.md").unwrap(),
+            root.join("projects/2026-09-11_9月11日 计算机视觉/a.md")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir_traversal() {
+        let root = std::path::Path::new("D:\\store");
+        // ★ 核心防线:不能借 .. 爬到 store 外面
+        for bad in [
+            "../secret.txt",
+            "projects/../../secret.txt",
+            "a/../../b",
+            "..",
+        ] {
+            assert!(
+                safe_join(root, bad).is_err(),
+                "含 .. 的路径必须被拒: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_paths() {
+        let root = std::path::Path::new("D:\\store");
+        for bad in [
+            "C:\\Windows\\System32\\x.dll",
+            "D:\\other\\file.txt",
+        ] {
+            // Windows 上绝对路径有盘符前缀;在别的平台这条可能退化成
+            // 普通相对路径,所以只断言"要么拒绝、要么确实落在 root 下"
+            match safe_join(root, bad) {
+                Err(_) => {}
+                Ok(p) => assert!(
+                    p.starts_with(root),
+                    "绝对路径不该逃出 root: {p:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_empty() {
+        let root = std::path::Path::new("D:\\store");
+        assert!(safe_join(root, "").is_err());
+        assert!(safe_join(root, "/").is_err());
+    }
 
     #[test]
     fn base64_decodes_png_signature() {
@@ -1843,6 +2217,10 @@ fn main() {
             set_sync_excluded_many,
             clear_sync_excludes,
             get_sync_inventory,
+            cloud_tree,
+            cloud_diff,
+            cloud_delete,
+            cloud_sync_one,
             check_frontend_deps,
             list_profiles,
             delete_profile,
@@ -1851,6 +2229,7 @@ fn main() {
             get_project,
             list_project_files,
             open_project_dir,
+            rename_project,
             save_mermaid_source,
             save_png,
             get_stats,

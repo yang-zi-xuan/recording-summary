@@ -385,17 +385,150 @@ impl ProjectStore {
         let slug = slugify(title, 60);
         let date = date_prefix();
         let stem = format!("{date}_{slug}");
+        Ok(self.unique_in(&base, &stem, None))
+    }
 
-        let mut cand = base.join(&stem);
+    /// 在 `base` 下找一个不冲突的目录名。
+    ///
+    /// `avoid` 用于重命名:原目录本身不算冲突(它会被移走)。
+    fn unique_in(&self, base: &Path, stem: &str, avoid: Option<&Path>) -> PathBuf {
+        let is_free = |p: &Path| -> bool {
+            if let Some(a) = avoid {
+                if p == a {
+                    return true;
+                }
+            }
+            !p.exists()
+        };
+
+        let mut cand = base.join(stem);
         let mut n = 2;
-        while cand.exists() {
+        while !is_free(&cand) {
             cand = base.join(format!("{stem}_{n}"));
             n += 1;
             if n > 999 {
-                return Err(anyhow!("同名工程过多,无法生成目录名"));
+                break;
             }
         }
-        Ok(cand)
+        cand
+    }
+
+    /// 重命名工程:**标题与目录名一起改**。
+    ///
+    /// # 为什么两个都改
+    ///
+    /// 工程目录是给人看的(`2026-09-11_9月11日 复兴路`),标题是界面上显示的。
+    /// 只改一个会让两者长期不一致 —— 用户在资源管理器里看到的和界面上看到的
+    /// 是两回事,反而更难找。
+    ///
+    /// # 保留日期前缀
+    ///
+    /// 目录名的 `<日期>_` 前缀是**创建日期**,不是"最后修改日期"。
+    /// 重命名时保留它 —— 否则用户重命名一次,这个工程的时间线就乱了,
+    /// 按时间排序会跳到最前面。
+    ///
+    /// # 对同步的影响
+    ///
+    /// **目录名变了,云端路径也全变。** 旧路径下的文件会变成孤儿。
+    /// 这里只做本地改名,并把"旧路径"返回给调用方,由它提醒用户 ——
+    /// 删除云端是 [`crate::sync`] 的事,而它有自己的安全规则
+    /// (范围、方向、删除策略),不该被一个重命名绕过去。
+    pub fn rename(&self, id_prefix: &str, new_title: &str) -> Result<RenameOutcome> {
+        let new_title = new_title.trim();
+        if new_title.is_empty() {
+            anyhow::bail!("新标题不能为空");
+        }
+        let p = self
+            .find(id_prefix)?
+            .ok_or_else(|| anyhow!("找不到工程: {id_prefix}"))?;
+
+        let old_dir = p.dir.clone();
+        let old_slug = p.meta.slug.clone();
+
+        // 保留原目录名的日期前缀;取不到就用今天
+        let date = slug_date_prefix(&old_slug).unwrap_or_else(date_prefix);
+        let stem = format!("{date}_{}", slugify(new_title, 60));
+
+        let base = self.projects_dir();
+        let target = self.unique_in(&base, &stem, Some(&old_dir));
+
+        if target == old_dir {
+            // 名字没变(或只差非法字符),只更新标题
+            let mut m = p.meta.clone();
+            m.title = new_title.to_string();
+            m.updated_at = crate::store::db::now_ms();
+            let np = Project {
+                dir: old_dir.clone(),
+                meta: m,
+            };
+            np.save_meta()?;
+            return Ok(RenameOutcome {
+                dir: old_dir,
+                old_slug,
+                slug_changed: false,
+                warning: None,
+            });
+        }
+
+        // 先移动目录,再把新元数据写进去 ——
+        // 顺序反过来的话,移动失败会留下一个"标题已改但目录没动"的中间态。
+        std::fs::rename(&old_dir, &target)
+            .with_context(|| format!("重命名目录失败: {} -> {}", old_dir.display(), target.display()))?;
+
+        let mut m = p.meta.clone();
+        m.title = new_title.to_string();
+        m.slug = target
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| stem.clone());
+        m.updated_at = crate::store::db::now_ms();
+
+        let np = Project {
+            dir: target.clone(),
+            meta: m,
+        };
+        if let Err(e) = np.save_meta() {
+            // 元数据写不进去就把目录移回去,别留下半截状态
+            let _ = std::fs::rename(&target, &old_dir);
+            return Err(e).context("写入新元数据失败,已回滚目录改名");
+        }
+
+        Ok(RenameOutcome {
+            dir: target,
+            old_slug,
+            slug_changed: true,
+            warning: None,
+        })
+    }
+}
+
+/// 重命名的结果。
+#[derive(Clone, Debug)]
+pub struct RenameOutcome {
+    /// 改名后的目录
+    pub dir: PathBuf,
+    /// 原来的目录名(用于提醒云端路径已变)
+    pub old_slug: String,
+    /// 目录名是否真的变了
+    pub slug_changed: bool,
+    /// 需要提醒用户的事
+    pub warning: Option<String>,
+}
+
+/// 从 `<YYYY-MM-DD>_<标题>` 里取出日期部分。
+fn slug_date_prefix(slug: &str) -> Option<String> {
+    let (head, _) = slug.split_once('_')?;
+    let b = head.as_bytes();
+    if b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(|c| c.is_ascii_digit())
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[8..10].iter().all(|c| c.is_ascii_digit())
+    {
+        Some(head.to_string())
+    } else {
+        None
     }
 }
 
@@ -811,5 +944,161 @@ mod tests {
         assert_eq!(d.len(), 10, "{d}");
         assert_eq!(&d[4..5], "-");
         assert_eq!(&d[7..8], "-");
+    }
+
+    // --- 重命名 ------------------------------------------------------------
+
+    #[test]
+    fn rename_changes_title_and_directory() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("hash_a", "9月11日 复兴路").unwrap();
+        let old_dir = p.dir.clone();
+        assert!(old_dir.to_string_lossy().contains("9月11日 复兴路"));
+
+        let out = store.rename("hash_a", "图像处理第一讲").unwrap();
+        assert!(out.slug_changed);
+        assert!(old_dir.exists() == false, "旧目录应已移走");
+        assert!(out.dir.is_dir(), "新目录应存在");
+        assert!(
+            out.dir.to_string_lossy().contains("图像处理第一讲"),
+            "{:?}",
+            out.dir
+        );
+
+        // 重新读出来:标题与 slug 都应更新
+        let reloaded = store.find("hash_a").unwrap().unwrap();
+        assert_eq!(reloaded.meta.title, "图像处理第一讲");
+        assert!(reloaded.meta.slug.contains("图像处理第一讲"));
+        assert_eq!(reloaded.dir, out.dir);
+    }
+
+    #[test]
+    fn rename_preserves_date_prefix() {
+        // ★ 日期前缀是**创建日期**,不是修改日期。
+        //   重命名不该让它跳到"今天",否则按时间排序会乱。
+        let (_d, store) = fixture();
+        let p = store.create_or_open("h", "旧名").unwrap();
+        let old_slug = p.meta.slug.clone();
+        let date = old_slug.split('_').next().unwrap().to_string();
+
+        let out = store.rename("h", "新名").unwrap();
+        let new_slug = out.dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            new_slug.starts_with(&format!("{date}_")),
+            "日期前缀应保持 {date},实际 {new_slug}"
+        );
+    }
+
+    #[test]
+    fn rename_keeps_project_id_and_contents() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("hash_keep", "原名").unwrap();
+        // 放点内容进去,确认移动后还在
+        std::fs::write(p.dir.join(TRANSCRIPT_MD), "转写内容").unwrap();
+
+        let out = store.rename("hash_keep", "改名后").unwrap();
+
+        assert_eq!(store.find("hash_keep").unwrap().unwrap().meta.id, "hash_keep");
+        assert_eq!(
+            std::fs::read_to_string(out.dir.join(TRANSCRIPT_MD)).unwrap(),
+            "转写内容",
+            "★ 改名不能丢内容"
+        );
+        assert!(out.dir.join(AUDIO_DIR).is_dir(), "audio 子目录也要跟着走");
+    }
+
+    #[test]
+    fn rename_to_same_name_only_updates_title() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("h", "同一个名字").unwrap();
+        let dir = p.dir.clone();
+
+        let out = store.rename("h", "同一个名字").unwrap();
+        assert!(!out.slug_changed, "名字没变就不该动目录");
+        assert_eq!(out.dir, dir);
+        assert_eq!(store.find("h").unwrap().unwrap().meta.title, "同一个名字");
+    }
+
+    #[test]
+    fn rename_handles_illegal_chars_in_title() {
+        let (_d, store) = fixture();
+        store.create_or_open("h", "原名").unwrap();
+        // Windows 目录名不允许这些字符
+        let out = store.rename("h", "a/b:c*d?e").unwrap();
+        let name = out.dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.contains(['/', ':', '*', '?']), "{name}");
+    }
+
+    #[test]
+    fn rename_to_existing_name_gets_suffix() {
+        let (_d, store) = fixture();
+        let a = store.create_or_open("h1", "重名测试").unwrap();
+        let b = store.create_or_open("h2", "另一个").unwrap();
+        // 让两个工程同一天,这样 slug 的日期前缀一致
+        let date = a.meta.slug.split('_').next().unwrap().to_string();
+
+        let out = store.rename("h2", "重名测试").unwrap();
+        let name = out.dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with(&date), "{name}");
+        assert!(name.contains("重名测试"));
+        assert_ne!(out.dir, a.dir, "★ 不能覆盖已有工程");
+        assert!(a.dir.is_dir(), "被撞名的工程必须完好");
+        assert!(b.dir.exists() == false, "原目录应已移走");
+    }
+
+    #[test]
+    fn rename_rejects_empty_title() {
+        let (_d, store) = fixture();
+        store.create_or_open("h", "原名").unwrap();
+        assert!(store.rename("h", "").is_err());
+        assert!(store.rename("h", "   ").is_err());
+    }
+
+    #[test]
+    fn rename_rejects_unknown_project() {
+        let (_d, store) = fixture();
+        let e = store.rename("nope", "新名").unwrap_err();
+        assert!(e.to_string().contains("找不到"), "{e}");
+    }
+
+    #[test]
+    fn rename_trims_whitespace() {
+        let (_d, store) = fixture();
+        store.create_or_open("h", "原名").unwrap();
+        let out = store.rename("h", "  前后有空格  ").unwrap();
+        assert_eq!(store.find("h").unwrap().unwrap().meta.title, "前后有空格");
+        let name = out.dir.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.ends_with(' '), "目录名不该以空格结尾:{name}");
+    }
+
+    #[test]
+    fn rename_supports_id_prefix() {
+        let (_d, store) = fixture();
+        store.create_or_open("abcdef123456", "原名").unwrap();
+        let out = store.rename("abcdef", "用前缀改名").unwrap();
+        assert!(out.dir.to_string_lossy().contains("用前缀改名"));
+    }
+
+    #[test]
+    fn slug_date_prefix_extracts_only_valid_dates() {
+        assert_eq!(
+            slug_date_prefix("2026-09-11_高等数学"),
+            Some("2026-09-11".into())
+        );
+        assert_eq!(slug_date_prefix("没日期_标题"), None);
+        assert_eq!(slug_date_prefix("2026-09-1_标题"), None, "半个日期不算");
+        assert_eq!(slug_date_prefix("no-underscore"), None);
+        assert_eq!(slug_date_prefix("2026/09/11_标题"), None);
+    }
+
+    #[test]
+    fn rename_reports_old_slug_for_sync_warning() {
+        // 重命名会改变云端路径,调用方需要知道旧名字才能提醒用户
+        let (_d, store) = fixture();
+        let p = store.create_or_open("h", "旧名字").unwrap();
+        let before = p.meta.slug.clone();
+        let out = store.rename("h", "新名字").unwrap();
+        assert_eq!(out.old_slug, before);
+        assert_ne!(out.old_slug, store.find("h").unwrap().unwrap().meta.slug);
     }
 }
