@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>录音转总结</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+  <!-- 侧栏 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">录</span>
+      <div>
+        <div class="brand-title">录音转总结</div>
+        <div class="brand-sub">本地转写 · 云端纪要</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item active" data-view="process">
+        <span class="nav-ico">▶</span> 处理录音
+      </button>
+      <button class="nav-item" data-view="projects">
+        <span class="nav-ico">▤</span> 我的工程
+      </button>
+      <button class="nav-item" data-view="history">
+        <span class="nav-ico">≡</span> 历史记录
+      </button>
+      <button class="nav-item" data-view="profiles">
+        <span class="nav-ico">◍</span> 声纹档案
+      </button>
+      <button class="nav-item" data-view="sync">
+        <span class="nav-ico">☁</span> 云端同步
+      </button>
+      <button class="nav-item" data-view="settings">
+        <span class="nav-ico">⚙</span> 设置
+      </button>
+    </nav>
+
+    <div class="hw-card" id="hwCard">
+      <div class="hw-loading">正在探测硬件…</div>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main class="main">
+
+    <!-- 处理 -->
+    <section class="view active" id="view-process">
+      <header class="view-head">
+        <h1>处理录音</h1>
+        <p class="muted">音频不出本机。只有转写后的文字会发送给你选择的 LLM 服务商。</p>
+      </header>
+
+      <div class="dropzone" id="dropzone">
+        <div class="dz-icon">🎧</div>
+        <div class="dz-title">把音频文件拖到这里</div>
+        <div class="dz-sub">或 <button class="link" id="btnPick">选择文件</button></div>
+        <div class="dz-types">支持 wav / mp3 / m4a / mp4 / flac 等(非 wav 需要 ffmpeg)</div>
+        <div class="dz-file" id="pickedFile"></div>
+      </div>
+
+      <div class="options">
+        <div class="opt">
+          <label>语言</label>
+          <select id="optLanguage">
+            <option value="">自动检测</option>
+            <option value="zh" selected>中文(自动转简体)</option>
+            <option value="en">英文</option>
+            <option value="ja">日文</option>
+          </select>
+        </div>
+        <div class="opt">
+          <label>模型</label>
+          <select id="optModel"><option value="">按硬件自动</option></select>
+        </div>
+        <div class="opt">
+          <label>说话人数量</label>
+          <select id="optSpeakers">
+            <option value="">自动检测</option>
+            <option value="2">2 人</option>
+            <option value="3">3 人</option>
+            <option value="4">4 人</option>
+            <option value="5">5 人</option>
+            <option value="6">6 人</option>
+            <option value="8">8 人</option>
+          </select>
+        </div>
+        <div class="opt wide">
+          <label>术语表 <span class="hint">(逗号分隔,能降低同音字与专业词错误)</span></label>
+          <input type="text" id="optTerms" placeholder="例如:反向传播,梯度下降,Transformer">
+        </div>
+        <div class="opt checks">
+          <label class="chk"><input type="checkbox" id="optNoDiarize"> 跳过说话人区分</label>
+          <label class="chk"><input type="checkbox" id="optNoSummary"> 只转写,不生成纪要</label>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary" id="btnStart" disabled>开始处理</button>
+        <button class="btn danger hidden" id="btnCancel">取消</button>
+      </div>
+
+      <div class="progress-card hidden" id="progressCard">
+        <div class="prog-head">
+          <span id="progStage">准备中…</span>
+          <span class="muted" id="progPct"></span>
+        </div>
+        <div class="bar"><div class="bar-fill" id="progBar"></div></div>
+        <div class="prog-detail" id="progDetail"></div>
+        <div class="log" id="progLog"></div>
+      </div>
+
+      <div class="result hidden" id="resultCard"></div>
+    </section>
+
+    <!-- 历史 -->
+    <section class="view" id="view-history">
+      <header class="view-head">
+        <h1>历史记录</h1>
+        <p class="muted">已经处理过的录音,点开可以查看转写与纪要。</p>
+      </header>
+      <div id="historyList" class="list"></div>
+    </section>
+
+    <!-- 详情 -->
+    <section class="view" id="view-detail">
+      <header class="view-head row">
+        <div>
+          <button class="btn ghost" id="btnBack">← 返回</button>
+          <h1 id="detailTitle">—</h1>
+          <p class="muted" id="detailMeta"></p>
+        </div>
+      </header>
+
+      <div class="banner hidden" id="staleBanner">
+        发言人名字已更新,当前纪要里仍是旧名字。<button class="link" id="btnRegenHint">如何重新生成</button>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" data-tab="summary">纪要</button>
+        <button class="tab" data-tab="dialogue">对话体</button>
+        <button class="tab" data-tab="timeline">时间轴</button>
+        <button class="tab" data-tab="plain">纯文本</button>
+        <button class="tab" data-tab="srt">SRT</button>
+        <button class="tab" data-tab="speakers">发言人</button>
+      </div>
+
+      <div class="tabbar">
+        <button class="btn ghost sm" id="btnCopyTab">复制当前内容</button>
+        <button class="btn ghost sm" id="btnSaveTab">另存为…</button>
+      </div>
+
+      <div class="tab-body">
+        <div class="tabpane active" id="pane-summary"><div class="md" id="contentSummary"></div></div>
+        <div class="tabpane" id="pane-dialogue"><pre id="contentDialogue"></pre></div>
+        <div class="tabpane" id="pane-timeline"><pre id="contentTimeline"></pre></div>
+        <div class="tabpane" id="pane-plain"><pre id="contentPlain"></pre></div>
+        <div class="tabpane" id="pane-srt"><pre id="contentSrt"></pre></div>
+        <div class="tabpane" id="pane-speakers"><div id="contentSpeakers"></div></div>
+      </div>
+    </section>
+
+    <!-- 我的工程 -->
+    <section class="view" id="view-projects">
+      <header class="view-head">
+        <h1>我的工程</h1>
+        <p class="muted">每处理一段录音就会自动建一个工程,里面装着录音、转写、两份总结和思维导图,可以整个目录打包带走。</p>
+      </header>
+      <div id="projectList" class="list"></div>
+    </section>
+
+    <!-- 工程详情 -->
+    <section class="view" id="view-project">
+      <header class="view-head row">
+        <div>
+          <button class="btn ghost" id="btnProjectBack">← 返回</button>
+          <h1 id="projTitle">—</h1>
+          <p class="muted" id="projMeta"></p>
+        </div>
+        <div class="actions">
+          <button class="btn ghost sm" id="btnOpenDir">打开目录</button>
+        </div>
+      </header>
+
+      <div class="banner hidden" id="projBanner"></div>
+
+      <div class="tabs">
+        <button class="tab active" data-ptab="brief">简略总结</button>
+        <button class="tab" data-ptab="detailed">详细总结</button>
+        <button class="tab" data-ptab="mindmap">思维导图</button>
+        <button class="tab" data-ptab="transcript">转写</button>
+        <button class="tab" data-ptab="srt">SRT</button>
+        <button class="tab" data-ptab="files">工程文件</button>
+      </div>
+
+      <div class="tabbar">
+        <button class="btn ghost sm" id="btnProjCopy">复制当前内容</button>
+        <button class="btn ghost sm" id="btnProjSave">另存为…</button>
+      </div>
+
+      <div class="tab-body">
+        <div class="tabpane" id="ppane-brief"><div class="md" id="projBrief"></div></div>
+        <div class="tabpane" id="ppane-detailed"><div class="md" id="projDetailed"></div></div>
+
+        <div class="tabpane" id="ppane-mindmap">
+          <div class="mindmap-bar">
+            <button class="btn ghost sm" id="btnMmZoomOut">−</button>
+            <button class="btn ghost sm" id="btnMmZoomIn">+</button>
+            <button class="btn ghost sm" id="btnMmFit">适应</button>
+            <button class="btn ghost sm" id="btnMmPng">导出 PNG</button>
+            <button class="btn ghost sm" id="btnMmSource">源码</button>
+            <span class="muted" id="mmStatus"></span>
+          </div>
+          <div class="mindmap-wrap" id="mindmapWrap">
+            <div class="mindmap-inner" id="mindmapTarget"></div>
+          </div>
+          <div class="hidden" id="mmFallback">
+            <p class="muted">图渲染失败,以下是文本大纲:</p>
+            <pre id="mmOutline"></pre>
+          </div>
+          <pre class="hidden" id="mmSource"></pre>
+        </div>
+
+        <div class="tabpane" id="ppane-transcript"><pre id="projTranscript"></pre></div>
+        <div class="tabpane" id="ppane-srt"><pre id="projSrt"></pre></div>
+        <div class="tabpane" id="ppane-files"><div id="projFiles"></div></div>
+      </div>
+    </section>
+
+    <!-- 声纹档案 -->
+    <section class="view" id="view-profiles">
+      <header class="view-head">
+        <h1>声纹档案</h1>
+        <p class="muted">档案保存在本机,不会上传。向量只跟着音频走 —— 没有音频的机器留着它也没用。</p>
+      </header>
+      <div id="profileList" class="list"></div>
+    </section>
+
+    <!-- 同步 -->
+    <section class="view" id="view-sync">
+      <header class="view-head">
+        <h1>云端同步</h1>
+        <p class="muted">文本走 WebDAV;音频交给 Seafile 客户端(原因见下方说明)。</p>
+      </header>
+
+      <div class="card">
+        <h3>WebDAV 账号</h3>
+        <div class="form">
+          <label>服务地址<input type="text" id="syncUrl" placeholder="https://cloud.example.com/seafdav" title="也可以直接粘贴完整地址,程序会自动拆分出远端目录"></label>
+          <label>用户名<input type="text" id="syncUser" placeholder="2025000000@auth.local"></label>
+          <label>密码<input type="password" id="syncPass" placeholder="留空则不修改"></label>
+          <label>远端目录<input type="text" id="syncDir" placeholder="recording_summary" title="支持多级,例如 recording_summary/2026秋"></label>
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btnSyncSave">保存</button>
+          <button class="btn ghost" id="btnSyncTest">测试连接</button>
+          <button class="btn ghost" id="btnSyncPlan">查看同步计划</button>
+          <button class="btn primary" id="btnSyncRun">开始同步</button>
+        </div>
+        <div class="log hidden" id="syncLog"></div>
+      </div>
+
+      <div class="card">
+        <h3>音频怎么同步</h3>
+        <p class="muted" id="audioHint">—</p>
+      </div>
+
+      <!-- 同步方向与策略 -->
+      <div class="card">
+        <h3>同步方向</h3>
+        <p class="muted">决定数据往哪边流。反方向的差异不会被传输,也不会被删除。</p>
+        <div class="radios" id="dirRadios">
+          <label class="radio"><input type="radio" name="dir" value="both" checked>
+            <span><b>双向</b><small>本地更新传上去,云端更新拉下来</small></span></label>
+          <label class="radio"><input type="radio" name="dir" value="upload">
+            <span><b>只上传</b><small>本地 → 云端。云端多出来的不动</small></span></label>
+          <label class="radio"><input type="radio" name="dir" value="download">
+            <span><b>只下载</b><small>云端 → 本地。不会删云端</small></span></label>
+        </div>
+
+        <h3 class="mt">本地删除时</h3>
+        <div class="radios" id="delRadios">
+          <label class="radio"><input type="radio" name="del" value="keep">
+            <span><b>从不删云端</b><small>同步只做"加"和"改"</small></span></label>
+          <label class="radio"><input type="radio" name="del" value="text" checked>
+            <span><b>只删文本</b><small>文本双向镜像,录音永不删(推荐)</small></span></label>
+          <label class="radio"><input type="radio" name="del" value="mirror">
+            <span><b>完全镜像</b><small class="warn-text">包含录音。误删会同步到所有设备</small></span></label>
+        </div>
+
+        <h3 class="mt">录音</h3>
+        <div class="radios" id="audioRadios">
+          <label class="radio"><input type="radio" name="aud" value="sync" checked>
+            <span><b>参与同步</b><small>按上面的方向处理</small></span></label>
+          <label class="radio"><input type="radio" name="aud" value="skip">
+            <span><b>不同步</b><small>录音完全不参与,交给网盘客户端</small></span></label>
+        </div>
+
+        <div class="actions mt">
+          <button class="btn primary" id="btnScopeSave">保存设置</button>
+          <span class="muted" id="scopeSummary">—</span>
+        </div>
+      </div>
+
+      <!-- 同步清单 -->
+      <div class="card">
+        <div class="row" style="align-items:center">
+          <h3 style="margin:0">同步清单</h3>
+          <div class="actions" style="margin-left:auto">
+            <button class="btn ghost sm" id="btnInvExpand">全部展开</button>
+            <button class="btn ghost sm" id="btnInvCollapse">全部折叠</button>
+            <button class="btn ghost sm" id="btnInvProbe"
+              title="为每个文件发一个 HEAD 请求确认云端状态。文件多时会慢">核实云端状态</button>
+            <button class="btn ghost sm" id="btnInvClear">恢复全部同步</button>
+          </div>
+        </div>
+        <p class="muted" style="margin:10px 0 4px">
+          勾选 = 参与同步。<b>取消勾选只是不同步,云端的副本不会被删掉。</b>
+        </p>
+        <div class="inv-legend" id="invLegend"></div>
+        <div class="inv-tree" id="invTree">—</div>
+      </div>
+
+      <div class="card hidden" id="planCard">
+        <h3>同步计划</h3>
+        <div id="planList"></div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings">
+      <header class="view-head">
+        <h1>设置</h1>
+        <p class="muted">API Key 与 WebDAV 密码存在 Windows 凭据管理器,不写入任何配置文件。</p>
+      </header>
+
+      <div class="card">
+        <h3>LLM 总结服务</h3>
+        <div class="form">
+          <label>预设供应商
+            <select id="llmPreset"><option value="">自定义</option></select>
+          </label>
+          <label>Base URL<input type="text" id="llmBaseUrl"></label>
+          <label>模型<input type="text" id="llmModel" list="llmModelList"><datalist id="llmModelList"></datalist></label>
+          <label>API Key <span class="hint" id="llmKeyHint"></span>
+            <input type="password" id="llmKey" placeholder="留空则不修改">
+          </label>
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="btnLlmSave">保存</button>
+          <button class="btn ghost" id="btnLlmTest">测试连接</button>
+          <button class="btn ghost" id="btnLlmClear">清除 Key</button>
+        </div>
+        <div class="log hidden" id="llmLog"></div>
+      </div>
+
+      <div class="card">
+        <h3>硬件与模型</h3>
+        <div id="hwDetail">—</div>
+        <div class="actions">
+          <button class="btn ghost" id="btnRefreshHw">重新探测</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>数据统计</h3>
+        <div id="statsBox">—</div>
+      </div>
+
+      <div class="card">
+        <h3>前端依赖</h3>
+        <div id="depsBox">—</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="vendor/mermaid.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

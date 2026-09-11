@@ -1,0 +1,50 @@
+# 构建产物
+/target/
+
+# 运行时数据(默认在用户数据目录,但开发时可能落到这里)
+/data/
+/testdata/
+/.testdata/
+/.e2e/
+
+# 工程目录。正常情况下它在数据目录里,但 --data-dir 指到仓库时会出现
+/projects/
+
+# 中间文件与探针
+/.build-probe/
+*.log
+
+# Tauri 构建时自动生成的 schema。
+#
+# `src-tauri/build.rs` 里只有 `tauri_build::build()`,这四个文件每次构建
+# 都会重新生成。提交它们只会让每次编译都产生无意义的 diff。
+/src-tauri/gen/
+
+# 桌面快捷方式脚本生成的产物(如果有)
+*.lnk
+
+# 第三方前端库是下载来的,可从 ui/vendor/README.txt 的步骤重新获取
+/ui/vendor/*
+!/ui/vendor/README.txt
+
+# 模型与二进制是资产,不入库(体积大且可从 README 的步骤重建)
+/models/*.bin
+/models/*.onnx
+/models/sherpa-onnx-pyannote-segmentation-3-0/
+/binaries/cuda/*.dll
+/binaries/cuda/*.exe
+/binaries/cpu/
+/binaries/vulkan/
+/binaries/ffmpeg/
+
+# 例外:这些要保留
+!/native/sherpa-rs/**
+!/models/.gitkeep
+!/binaries/.gitkeep
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
