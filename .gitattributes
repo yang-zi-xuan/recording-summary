@@ -1,0 +1,24 @@
+# 统一行尾。见 https://git-scm.com/docs/gitattributes
+#
+# 默认:仓库内保存 LF,检出时按平台决定。
+# 不做这一步的话,Windows 上 `core.autocrlf=true` 会让 git 反复
+# 报告 "LF will be replaced by CRLF",每次 diff 都有一堆噪音。
+
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF,否则某些解析器会出错
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# PowerShell 脚本保持 LF(已验证在 Windows PowerShell 5.1 下正常)
+*.ps1 text eol=lf
+
+# 二进制文件不要动
+*.png binary
+*.ico binary
+*.jpg binary
+*.dll binary
+*.lib binary
+*.exe binary
+*.bin binary
+*.onnx binary
