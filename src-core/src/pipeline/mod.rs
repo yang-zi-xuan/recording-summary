@@ -219,6 +219,48 @@ pub struct PipelineConfig {
     pub enable_summary: bool,
     /// 是否做术语校正(建议开,成本极低但收益明显)
     pub enable_term_correction: bool,
+    /// 转写引擎。
+    ///
+    /// 默认 [`Engine::Whisper`] —— 它快得多(2 小时录音约 10 分钟,
+    /// 而 FireRedASR2 约 50 分钟)。中文精度要求高时切
+    /// [`Engine::Crisp`],实测对比见 [`crate::asr_crisp`] 模块文档。
+    pub engine: Engine,
+}
+
+/// 用哪个转写引擎。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// whisper.cpp —— 快,多语言,中文精度中上
+    #[default]
+    Whisper,
+    /// CrispASR(默认装 FireRedASR2)—— 中文精度高,慢约 6 倍
+    Crisp(crate::asr_crisp::CrispBackend),
+}
+
+impl Engine {
+    /// 从 CLI/GUI 的字符串解析。
+    ///
+    /// `"whisper"` / 空 → Whisper;`"firered"` / `"qwen3"` /
+    /// `"sensevoice"` / `"glm-asr"` → 对应的 CrispASR 后端。
+    pub fn parse(s: &str) -> Option<Self> {
+        let t = s.trim().to_ascii_lowercase();
+        if t.is_empty() || t == "whisper" || t == "whisper.cpp" || t == "default" {
+            return Some(Engine::Whisper);
+        }
+        crate::asr_crisp::CrispBackend::parse(&t).map(Engine::Crisp)
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Engine::Whisper => "whisper.cpp".into(),
+            Engine::Crisp(b) => format!("CrispASR/{}", b.label()),
+        }
+    }
+
+    /// 是不是 CrispASR 系(决定要不要去查 crispasr.exe)。
+    pub fn is_crisp(&self) -> bool {
+        matches!(self, Engine::Crisp(_))
+    }
 }
 
 impl PipelineConfig {
@@ -238,6 +280,7 @@ impl PipelineConfig {
             enable_diarize: true,
             enable_summary: true,
             enable_term_correction: true,
+            engine: Engine::Whisper,
         }
     }
 
@@ -300,6 +343,11 @@ pub struct PipelineOutcome {
     /// 界面上要显示它 —— "纠错改了 37 段"和"纠错被跳过了"对用户
     /// 是完全不同的信息,不能都不出声。
     pub correction_note: Option<String>,
+    /// **实际用的**引擎与模型(如 `"FireRedASR2 / firered-asr2-aed-q4_k"`)。
+    ///
+    /// 与 `hardware.model_recommended` 的区别:那是硬件**推荐**值,
+    /// 切了引擎之后仍然显示推荐的那个,会误导用户判断"我换的生效了没有"。
+    pub engine_label: String,
     /// 本次生成/复用的工程目录(None = 未启用工程制)
     pub project_dir: Option<PathBuf>,
 }
@@ -761,6 +809,21 @@ impl<'a> Pipeline<'a> {
             transcript_from_cache: from_cache,
             embeddings_from_cache,
             correction_note,
+            engine_label: {
+                // 引擎名 + 实际模型(没有就退回 ASR 的模型路径)
+                let eng = self.transcriber.name();
+                let mdl = self
+                    .transcriber
+                    .model_label(&asr_opts)
+                    .unwrap_or_else(|| {
+                        asr_opts
+                            .model_path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "?".into())
+                    });
+                format!("{eng} / {mdl}")
+            },
             project_dir,
         })
     }

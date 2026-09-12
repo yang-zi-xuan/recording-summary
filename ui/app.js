@@ -413,6 +413,8 @@ $('btnStart').addEventListener('click', async () => {
         language: $('optLanguage').value || null,
         model: $('optModel').value || null,
         backend: null,
+        // 引擎:whisper(快)/ firered(中文准,慢约 6 倍)/ qwen3 / sensevoice
+        engine: $('optEngine') ? $('optEngine').value || null : null,
         speakers: $('optSpeakers').value ? parseInt($('optSpeakers').value) : null,
         no_diarize: $('optNoDiarize').checked,
         no_summary: $('optNoSummary').checked,
@@ -502,11 +504,18 @@ listen('pipeline://done', (ev) => {
   const chips = [
     `<span class="chip">${o.duration_text}</span>`,
     `<span class="chip">${o.segment_count} 段</span>`,
-    `<span class="chip">${o.model}</span>`,
+    // ★ 显示**实际**引擎与模型 —— o.model 是硬件推荐值,切了引擎也不会变,
+    //   拿它显示会让人以为"换的模型没生效"。
+    `<span class="chip">${o.engine_label || o.model}</span>`,
     `<span class="chip">${o.backend_label}</span>`,
   ];
   if (o.from_cache) chips.push('<span class="chip ok">缓存命中</span>');
   if (o.speaker_count) chips.push(`<span class="chip">${o.speaker_count} 位发言人</span>`);
+  // 纠错情况也要露出来 —— 静默跳过和真的改了是完全不同的信息
+  if (o.correction_note) {
+    const cls = /失败|不符/.test(o.correction_note) ? 'chip warn' : 'chip';
+    chips.push(`<span class="${cls}">${o.correction_note}</span>`);
+  }
   if (o.scene_label) {
     const cls = o.scene_low_confidence ? 'chip warn' : 'chip ok';
     const pct = o.scene_confidence ? Math.round(o.scene_confidence * 100) + '%' : '';

@@ -74,6 +74,17 @@
           </select>
         </div>
         <div class="opt">
+          <label>转写引擎</label>
+          <select id="optEngine"
+            title="whisper 快(2 小时录音约 10 分钟);FireRedASR2 中文更准但慢约 6 倍(约 50 分钟)">
+            <option value="whisper" selected>whisper(快)</option>
+            <option value="firered">FireRedASR2(中文更准,慢 6 倍)</option>
+            <option value="qwen3">Qwen3-ASR(22 种方言)</option>
+            <option value="sensevoice">SenseVoice(最快)</option>
+            <option value="glm-asr">GLM-ASR-Nano</option>
+          </select>
+        </div>
+        <div class="opt">
           <label>模型</label>
           <select id="optModel"><option value="">按硬件自动</option></select>
         </div>

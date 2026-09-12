@@ -4,6 +4,7 @@
 //! 设计依据见 `docs/技术方案.md`。
 
 pub mod asr;
+pub mod asr_crisp;
 pub mod audio;
 pub mod diarize;
 pub mod hardware;

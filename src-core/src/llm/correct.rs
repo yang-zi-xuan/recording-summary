@@ -60,29 +60,58 @@ pub struct CorrectionStats {
     pub batches_failed: usize,
     /// 实际被改动的段数
     pub segments_changed: usize,
+    /// 送出去但**一个字都没改**的批次。
+    ///
+    /// 这**不是失败** —— LLM 看完认为这段没问题。但它必须和"失败"
+    /// 分开统计:否则摘要会把"无需纠错"报成"纠错未生效",
+    /// 让用户以为功能坏了。(实测踩到过:一段 107 字的转写,
+    /// LLM 认为不需要改,摘要却说"1 批全部跳过"。)
+    pub batches_unchanged: usize,
 }
 
 impl CorrectionStats {
     /// 一句话摘要,给界面用。
+    ///
+    /// 三种结果必须能区分开:
+    /// - **改了** → "已纠错 N 段"
+    /// - **没问题** → "N 批无需改动"  ← 和失败完全不同
+    /// - **出错了** → "N 批失败"
     pub fn summary(&self) -> String {
         if self.batches == 0 {
             return "未纠错".into();
         }
-        if self.batches_applied == 0 {
-            return format!(
-                "纠错未生效({} 批全部跳过:{} 批段数不符,{} 批失败)",
-                self.batches, self.batches_skipped_count_mismatch, self.batches_failed
-            );
+
+        let mut parts: Vec<String> = Vec::new();
+        if self.batches_applied > 0 {
+            parts.push(format!(
+                "已纠错 {} 段({} 批)",
+                self.segments_changed, self.batches_applied
+            ));
         }
-        let mut s = format!(
-            "已纠错 {} 段({} 批)",
-            self.segments_changed, self.batches_applied
-        );
-        let skipped = self.batches_skipped_count_mismatch + self.batches_failed;
-        if skipped > 0 {
-            s.push_str(&format!(";{skipped} 批保留原文"));
+        if self.batches_unchanged > 0 {
+            parts.push(format!("{} 批无需改动", self.batches_unchanged));
         }
-        s
+        if self.batches_skipped_count_mismatch > 0 {
+            parts.push(format!(
+                "{} 批段数不符已保留原文",
+                self.batches_skipped_count_mismatch
+            ));
+        }
+        if self.batches_failed > 0 {
+            parts.push(format!("{} 批失败", self.batches_failed));
+        }
+
+        // 全是失败 → 明确说失败,不要说成"未生效"这种含糊话
+        if self.batches_applied == 0
+            && self.batches_unchanged == 0
+            && self.batches_failed == self.batches
+        {
+            return format!("纠错全部失败({} 批)", self.batches);
+        }
+        if parts.is_empty() {
+            return "纠错未生效".into();
+        }
+        parts.join(";")
     }
 }
 
@@ -201,6 +230,9 @@ pub(crate) fn correct_with(
         }
         if applied_any {
             stats.batches_applied += 1;
+        } else {
+            // 一个字没改 —— 记成"无需改动",不是失败。
+            stats.batches_unchanged += 1;
         }
 
         start = end;
@@ -365,17 +397,67 @@ mod tests {
         let mut st = CorrectionStats::default();
         assert_eq!(st.summary(), "未纠错");
 
+        // 全部失败 → 明确说"失败",不要含糊成"未生效"
         st.batches = 3;
         st.batches_failed = 3;
         let s = st.summary();
-        assert!(s.contains("未生效"), "{s}");
+        assert!(s.contains("失败"), "{s}");
         assert!(s.contains('3'), "{s}");
 
+        // 改了 2 批、失败 1 批
         st.batches_applied = 2;
         st.segments_changed = 7;
         st.batches_failed = 1;
         let s = st.summary();
         assert!(s.contains('7'), "{s}");
-        assert!(s.contains("保留原文"), "{s}");
+        assert!(s.contains("失败"), "{s}");
+    }
+
+    /// ★ 回归测试:"无需改动"不能被报成"未生效"。
+    ///
+    /// 实测踩到:一段 107 字的转写,LLM 看完认为不需要改,
+    /// 而摘要说"纠错未生效(1 批全部跳过)" —— 用户会以为功能坏了。
+    /// 这两种情况的含义完全不同,必须分开说。
+    #[test]
+    fn unchanged_batches_are_not_reported_as_failure() {
+        let st = CorrectionStats {
+            batches: 1,
+            batches_unchanged: 1,
+            ..Default::default()
+        };
+        let s = st.summary();
+        assert!(s.contains("无需改动"), "应说'无需改动':{s}");
+        assert!(!s.contains("未生效"), "不该说'未生效':{s}");
+        assert!(!s.contains("失败"), "不该说'失败':{s}");
+    }
+
+    #[test]
+    fn mixed_outcomes_are_all_reported() {
+        let st = CorrectionStats {
+            batches: 5,
+            batches_applied: 2,
+            segments_changed: 9,
+            batches_unchanged: 2,
+            batches_failed: 1,
+            ..Default::default()
+        };
+        let s = st.summary();
+        assert!(s.contains('9'), "{s}"); // 改了 9 段
+        assert!(s.contains("无需改动"), "{s}"); // 2 批没问题
+        assert!(s.contains("失败"), "{s}"); // 1 批失败
+    }
+
+    #[test]
+    fn all_applied_reads_as_a_clean_success() {
+        let st = CorrectionStats {
+            batches: 3,
+            batches_applied: 3,
+            segments_changed: 21,
+            ..Default::default()
+        };
+        let s = st.summary();
+        assert!(s.contains("21"), "{s}");
+        assert!(!s.contains("无需要"), "{s}");
+        assert!(!s.contains("失败"), "{s}");
     }
 }

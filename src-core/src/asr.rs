@@ -135,6 +135,21 @@ pub trait Transcriber: Send + Sync {
     }
 
     fn name(&self) -> &str;
+
+    /// 实际用的模型标识,给界面显示用。
+    ///
+    /// 与 [`Self::name`] 的区别:`name` 是引擎(如 `"whisper.cpp"`),
+    /// 这个是**具体模型**。
+    ///
+    /// 加它是因为报告里原来只显示 `hw.model_recommended` ——
+    /// 那是**硬件推荐值**,在切到 CrispASR 之后仍然显示 `large-v3-turbo`,
+    /// 与实际用的 `firered-asr2-aed-q4_k` 不符。**先显示错的模型名
+    /// 比不显示更糟**:用户会据此判断"我换的模型生效了没有"。
+    ///
+    /// 默认实现返回 None(实现方可以不给)。
+    fn model_label(&self, _opts: &AsrOpts) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

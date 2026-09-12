@@ -78,7 +78,7 @@ enum Command {
         backend: Option<String>,
 
         /// 指定模型档位(默认按硬件推荐)
-        #[arg(long, value_name = "tiny|base|small|medium|large-v3-turbo")]
+        #[arg(long, value_name = "tiny|base|small|medium|large-v3-turbo|large-v3")]
         model: Option<String>,
 
         /// 语言(默认自动检测)
@@ -108,6 +108,14 @@ enum Command {
         /// 处理完后立刻打印纪要
         #[arg(long)]
         print: bool,
+
+        /// 转写引擎。
+        ///
+        /// whisper(默认,快)或 CrispASR 的中文专精后端。
+        /// 实测 5 分钟课堂录音:whisper large-v3 用 19.8 秒,
+        /// FireRedASR2 用 120 秒但中文错误明显更少(见 docs/转写质量改进方案.md)。
+        #[arg(long, value_name = "whisper|firered|qwen3|sensevoice|glm-asr")]
+        engine: Option<String>,
     },
 
     /// 显示某个会话的转写
@@ -372,6 +380,7 @@ fn main() -> Result<()> {
             terms,
             chunk_secs,
             print,
+            engine,
         } => {
             cmd_run(
                 &paths,
@@ -386,6 +395,7 @@ fn main() -> Result<()> {
                     terms,
                     chunk_secs,
                     print,
+                    engine,
                 },
             )
         }
@@ -552,9 +562,12 @@ struct RunArgs {
     terms: Vec<String>,
     chunk_secs: u64,
     print: bool,
+    /// 转写引擎:whisper(默认) | firered | qwen3 | sensevoice | glm-asr
+    engine: Option<String>,
 }
 
-fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file() {
+fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {
+    if !args.input.is_file() {
         anyhow::bail!("输入文件不存在: {}", args.input.display());
     }
 
@@ -564,6 +577,14 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
     cfg.chunk_target_ms = args.chunk_secs.max(30) * 1000;
     cfg.hotwords = args.terms.clone();
     cfg.enable_summary = !args.no_summary;
+    if let Some(e) = &args.engine {
+        cfg.engine = rs_core::pipeline::Engine::parse(e)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "未知引擎: {e}(可选 whisper / firered / qwen3 / sensevoice / glm-asr)"
+                )
+            })?;
+    }
     cfg.language = match args.language.as_deref() {
         None | Some("auto") => None,
         Some(l) => Some(l.to_string()),
@@ -588,8 +609,24 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
         cfg.model_override = Some(tier);
     }
 
-    // 引擎
-    let transcriber = WhisperCppSidecar::new(SidecarLocator::new(&p.binaries));
+    // 引擎。
+    //
+    // 两个实现都构造出来、按配置选一个引用 —— 因为 `Pipeline` 要的是
+    // `&dyn Transcriber`,而两个类型不同,没法用一个变量装。
+    let whisper = WhisperCppSidecar::new(SidecarLocator::new(&p.binaries));
+    let crisp = if let rs_core::pipeline::Engine::Crisp(b) = cfg.engine {
+        // 找不到就明确报出来,而不是静默退回 whisper ——
+        // 用户选了 CrispASR 却拿到 whisper 的结果是更坏的结果
+        Some(rs_core::asr_crisp::CrispAsrSidecar::discover(
+            &p.binaries, &p.models, b,
+        )?)
+    } else {
+        None
+    };
+    let transcriber: &dyn rs_core::asr::Transcriber = match &crisp {
+        Some(c) => c,
+        None => &whisper,
+    };
 
     // 总结器(可选)。
     //
@@ -614,7 +651,7 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
         None
     };
 
-    let pipe = Pipeline::new(cfg, &transcriber, summarizer.as_ref().map(|s| s as &dyn llm::Summarizer))?;
+    let pipe = Pipeline::new(cfg, transcriber, summarizer.as_ref().map(|s| s as &dyn llm::Summarizer))?;
 
     let input = AudioRef {
         path: args.input.clone(),
@@ -637,7 +674,13 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
     }
     if let Some(hw) = &outcome.hardware {
         println!("使用后端  : {}", hw.summary_line());
-        println!("使用模型  : {}", hw.model_recommended.label());
+        // ★ 显示**实际**用的引擎与模型。
+        //
+        //   原来这里只有 `hw.model_recommended` —— 那是硬件**推荐**值。
+        //   切到 CrispASR 之后它仍然显示 large-v3-turbo,而实际跑的是
+        //   firered-asr2-aed。**先显示错的模型名比不显示更糟**:
+        //   用户会据此判断"我换的模型生效了没有"。
+        println!("使用引擎  : {}", outcome.engine_label);
     }
     if outcome.transcript_from_cache {
         println!("转写来源  : 缓存命中(未重新转写)");

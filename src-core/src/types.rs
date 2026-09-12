@@ -281,6 +281,24 @@ pub enum ModelTier {
     Base,
     Small,
     Medium,
+    /// 完整版 large-v3。**精度最高,也最慢。**
+    ///
+    /// 与 [`Self::LargeV3Turbo`] 的区别是实打实的,不是量变:
+    ///
+    /// | | large-v3 | large-v3-turbo |
+    /// |---|---|---|
+    /// | 磁盘 | 2.9 GB | 1.5 GB |
+    /// | 5 分钟音频 | 19.9 s | 12.6 s(1.6 倍快)|
+    /// | 同一段实测字数 | **936** | 532 |
+    ///
+    /// ★ turbo 少输出的 43% **不是简洁,是丢内容。** 实测同一段课堂录音,
+    /// turbo 把"图像存储成矩阵、最小单元是像素"整段跳过了 —— 那是课程的
+    /// 实质内容,而它只吐了一串"像素坐标×6"的重复退化。
+    ///
+    /// 所以:要速度用 turbo,要完整用这个。自动选档仍然给 turbo
+    /// (它是更安全的默认),但这个档位必须**可选**,否则用户没法在
+    /// 精度不够时自己往上走。
+    LargeV3,
     LargeV3Turbo,
 }
 
@@ -291,6 +309,7 @@ impl ModelTier {
             ModelTier::Base => "ggml-base.bin",
             ModelTier::Small => "ggml-small.bin",
             ModelTier::Medium => "ggml-medium.bin",
+            ModelTier::LargeV3 => "ggml-large-v3.bin",
             ModelTier::LargeV3Turbo => "ggml-large-v3-turbo.bin",
         }
     }
@@ -302,6 +321,7 @@ impl ModelTier {
             ModelTier::Base => 142,
             ModelTier::Small => 466,
             ModelTier::Medium => 1500,
+            ModelTier::LargeV3 => 2950,
             ModelTier::LargeV3Turbo => 1620,
         }
     }
@@ -312,6 +332,7 @@ impl ModelTier {
             ModelTier::Base => "base",
             ModelTier::Small => "small",
             ModelTier::Medium => "medium",
+            ModelTier::LargeV3 => "large-v3",
             ModelTier::LargeV3Turbo => "large-v3-turbo",
         }
     }
@@ -322,9 +343,10 @@ impl ModelTier {
             "base" => Some(ModelTier::Base),
             "small" => Some(ModelTier::Small),
             "medium" => Some(ModelTier::Medium),
-            "large-v3-turbo" | "large_v3_turbo" | "turbo" | "large" => {
-                Some(ModelTier::LargeV3Turbo)
-            }
+            // ⚠️ `large` 曾经映射到 turbo —— 那是个误导:用户说 "large"
+            //    想的是最大最准的那个,拿到的却是蒸馏版。现在明确区分。
+            "large-v3" | "large_v3" | "large3" => Some(ModelTier::LargeV3),
+            "large-v3-turbo" | "large_v3_turbo" | "turbo" => Some(ModelTier::LargeV3Turbo),
             _ => None,
         }
     }
@@ -786,6 +808,52 @@ mod tests {
         assert_eq!(ModelTier::parse("TURBO"), Some(ModelTier::LargeV3Turbo));
         assert!(ModelTier::LargeV3Turbo.approx_mb() > ModelTier::Small.approx_mb());
         assert_eq!(ModelTier::Small.file_name(), "ggml-small.bin");
+    }
+
+    /// ★ `large` 必须指**完整版**,不能指 turbo。
+    ///
+    /// 它曾经映射到 turbo —— 用户说 "large" 想的是最大最准的那个,
+    /// 拿到的却是蒸馏版。这个歧义会直接导致"我明明选了大模型为什么还是不准"。
+    #[test]
+    fn parse_large_means_full_not_turbo() {
+        assert_eq!(ModelTier::parse("large-v3"), Some(ModelTier::LargeV3));
+        assert_eq!(ModelTier::parse("large_v3"), Some(ModelTier::LargeV3));
+        assert_eq!(ModelTier::parse("LARGE3"), Some(ModelTier::LargeV3));
+        // turbo 只能靠明确的名字拿到
+        assert_eq!(ModelTier::parse("turbo"), Some(ModelTier::LargeV3Turbo));
+        // 光写 "large" 不再被接受 —— 歧义太大,宁可报错让用户讲清楚
+        assert_eq!(ModelTier::parse("large"), None);
+    }
+
+    #[test]
+    fn full_large_v3_is_bigger_and_distinct_from_turbo() {
+        assert_ne!(ModelTier::LargeV3, ModelTier::LargeV3Turbo);
+        assert_eq!(ModelTier::LargeV3.file_name(), "ggml-large-v3.bin");
+        assert_eq!(ModelTier::LargeV3.label(), "large-v3");
+        // 完整版比蒸馏版大
+        assert!(
+            ModelTier::LargeV3.approx_mb() > ModelTier::LargeV3Turbo.approx_mb(),
+            "完整版应更大"
+        );
+        // 档位顺序:完整版是最大的
+        assert!(ModelTier::LargeV3.approx_mb() > ModelTier::Medium.approx_mb());
+    }
+
+    /// ★ 缓存键必须区分这两个档位。
+    ///
+    /// 否则切到 large-v3 会命中 turbo 的缓存 —— 用户以为换了模型,
+    /// 实际拿到的还是 turbo 的结果,而且**完全看不出来**。
+    #[test]
+    fn cache_tag_distinguishes_large_from_turbo() {
+        assert_ne!(
+            ModelTier::LargeV3.label(),
+            ModelTier::LargeV3Turbo.label(),
+            "两个档位的 label 必须不同,否则缓存会串"
+        );
+        assert_ne!(
+            ModelTier::LargeV3.file_name(),
+            ModelTier::LargeV3Turbo.file_name()
+        );
     }
 
     #[test]

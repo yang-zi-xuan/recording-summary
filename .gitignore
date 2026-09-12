@@ -28,19 +28,21 @@
 !/ui/vendor/README.txt
 
 # 模型与二进制是资产,不入库(体积大且可从 README 的步骤重建)
-/models/*.bin
-/models/*.onnx
-/models/sherpa-onnx-pyannote-segmentation-3-0/
-/binaries/cuda/*.dll
-/binaries/cuda/*.exe
-/binaries/cpu/
-/binaries/vulkan/
-/binaries/ffmpeg/
-
-# 例外:这些要保留
-!/native/sherpa-rs/**
+#
+# 用「排除目录下的一切、再放行小文本文件」的写法,而不是逐个扩展名列举。
+# 原因:漏一个扩展名就会把 GB 级文件放进仓库 —— 实测加 CrispASR 时
+# `models/firered/*.gguf`(919 MB)和 `binaries/crispasr/*.zip`(136 MB)
+# 都没被旧规则覆盖。**默认排除、白名单放行**更安全。
+/models/**
 !/models/.gitkeep
+!/models/README.md
+
+/binaries/**
 !/binaries/.gitkeep
+!/binaries/README.md
+
+# 例外:原生库要保留(体积小且国内下载困难,见 native/sherpa-rs/README.txt)
+!/native/sherpa-rs/**
 
 # 编辑器与系统
 .vscode/

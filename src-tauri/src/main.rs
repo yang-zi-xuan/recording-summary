@@ -222,6 +222,10 @@ struct RunOutcomeDto {
     /// 纠错情况("已纠错 N 段" / "未纠错" / "跳过纠错")。
     /// 界面要显示它 —— 静默跳过和真的改了是完全不同的信息。
     correction_note: Option<String>,
+    /// **实际用的**引擎与模型(如 "FireRedASR2 / firered-asr2-aed-q4_k")。
+    ///
+    /// 与 `model` 的区别:那个是硬件推荐值,切引擎后不会变。
+    engine_label: String,
     summary: Option<String>,
 }
 
@@ -235,6 +239,8 @@ struct RunRequest {
     no_diarize: bool,
     no_summary: bool,
     terms: Vec<String>,
+    /// 转写引擎:whisper(默认) | firered | qwen3 | sensevoice | glm-asr
+    engine: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +356,7 @@ fn list_models(state: State<AppState>) -> Vec<ModelRow> {
         ModelTier::Small,
         ModelTier::Medium,
         ModelTier::LargeV3Turbo,
+        ModelTier::LargeV3,
     ]
     .into_iter()
     .map(|t| {
@@ -631,6 +638,10 @@ fn start_run(
         .with_models(&p.models);
     cfg.hotwords = req.terms.clone();
     cfg.enable_summary = !req.no_summary;
+    if let Some(e) = req.engine.as_deref().filter(|s| !s.trim().is_empty()) {
+        cfg.engine = rs_core::pipeline::Engine::parse(e)
+            .ok_or_else(|| format!("未知引擎: {e}"))?;
+    }
     cfg.language = match req.language.as_deref() {
         None | Some("") | Some("auto") => None,
         Some(l) => Some(l.to_string()),
@@ -703,13 +714,30 @@ fn run_pipeline(
     input_path: &std::path::Path,
     sink: &ProgressSink,
 ) -> Result<RunOutcomeDto> {
-    let transcriber = WhisperCppSidecar::new(SidecarLocator::new(binaries));
+    // 引擎选择。
+    //
+    // 两个实现都构造、按配置选引用 —— `Pipeline` 要的是 `&dyn Transcriber`,
+    // 两个具体类型没法装进同一个变量。
+    let whisper = WhisperCppSidecar::new(SidecarLocator::new(binaries));
+    let crisp = if let rs_core::pipeline::Engine::Crisp(b) = cfg.engine {
+        // 找不到就报错,不静默退回 whisper ——
+        // 用户选了 CrispASR 却拿到 whisper 的结果是更坏的结果
+        Some(rs_core::asr_crisp::CrispAsrSidecar::discover(
+            binaries, models, b,
+        )?)
+    } else {
+        None
+    };
+    let transcriber: &dyn rs_core::asr::Transcriber = match &crisp {
+        Some(c) => c,
+        None => &whisper,
+    };
 
     // 总结器:Key 没配就跳过,不阻塞转写
     let summarizer = build_summarizer(data_dir).ok();
     let sum_ref = summarizer.as_ref().map(|s| s as &dyn llm::Summarizer);
 
-    let pipe = Pipeline::new(cfg, &transcriber, sum_ref)?;
+    let pipe = Pipeline::new(cfg, transcriber, sum_ref)?;
 
     let input = AudioRef {
         path: input_path.to_path_buf(),
@@ -740,6 +768,7 @@ fn run_pipeline(
         scene_confidence: out.scene.as_ref().map(|v| v.confidence),
         scene_low_confidence: out.scene.as_ref().map(|v| v.is_low_confidence()).unwrap_or(false),
         correction_note: out.correction_note.clone(),
+        engine_label: out.engine_label.clone(),
         summary: out.summary.as_ref().map(|s| s.content_md.clone()),
         session_id: out.session_id,
     })
