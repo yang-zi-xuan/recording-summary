@@ -591,13 +591,22 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
     // 引擎
     let transcriber = WhisperCppSidecar::new(SidecarLocator::new(&p.binaries));
 
-    // 总结器(可选)
-    let summarizer = if cfg.enable_summary {
+    // 总结器(可选)。
+    //
+    // ⚠️ **纠错也要用它** —— 纠错是 LLM 调用,而 LLM 客户端就装在这里。
+    //    所以只要"要总结"**或**"要纠错"就得建它,否则用 --no-summary
+    //    时会连带把纠错也关掉(而两者本该独立)。
+    let summarizer = if cfg.enable_summary || cfg.enable_term_correction {
         match build_summarizer(&p.data_dir) {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("⚠ 无法启用纪要生成:{e}");
-                eprintln!("  转写仍会完成。配置好 API Key 后可重新运行以生成纪要。");
+                if cfg.enable_summary {
+                    eprintln!("⚠ 无法启用纪要生成:{e}");
+                    eprintln!("  转写仍会完成。配置好 API Key 后可重新运行以生成纪要。");
+                } else {
+                    // 只开了纠错的情况 —— 别说成"纪要生成"
+                    eprintln!("⚠ 无法启用转写纠错:{e}");
+                }
                 None
             }
         }
@@ -632,6 +641,10 @@ fn cmd_run(p: &Paths, args: RunArgs) -> Result<()> {    if !args.input.is_file()
     }
     if outcome.transcript_from_cache {
         println!("转写来源  : 缓存命中(未重新转写)");
+    }
+    // 纠错情况要报 —— "改了 37 段"和"被跳过了"是完全不同的信息
+    if let Some(note) = &outcome.correction_note {
+        println!("转写纠错  : {note}");
     }
     if let Some(v) = &outcome.scene {
         println!(

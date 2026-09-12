@@ -218,7 +218,11 @@ struct RunOutcomeDto {
     from_cache: bool,
     scene_label: Option<String>,
     scene_confidence: Option<f32>,
-    scene_low_confidence: bool,    summary: Option<String>,
+    scene_low_confidence: bool,
+    /// 纠错情况("已纠错 N 段" / "未纠错" / "跳过纠错")。
+    /// 界面要显示它 —— 静默跳过和真的改了是完全不同的信息。
+    correction_note: Option<String>,
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -735,6 +739,7 @@ fn run_pipeline(
         scene_label: out.scene.as_ref().map(|v| v.scene.label().to_string()),
         scene_confidence: out.scene.as_ref().map(|v| v.confidence),
         scene_low_confidence: out.scene.as_ref().map(|v| v.is_low_confidence()).unwrap_or(false),
+        correction_note: out.correction_note.clone(),
         summary: out.summary.as_ref().map(|s| s.content_md.clone()),
         session_id: out.session_id,
     })

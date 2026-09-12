@@ -36,6 +36,8 @@ pub enum Stage {
     Decode,
     Transcribe,
     Diarize,
+    /// 转写纠错(用 LLM 修同音字与术语)。见 `llm::correct`。
+    Correct,
     Identify,
     SceneDetect,
     Summarize,
@@ -49,6 +51,7 @@ impl Stage {
             Stage::Decode => "解码音频",
             Stage::Transcribe => "转写",
             Stage::Diarize => "说话人区分",
+            Stage::Correct => "转写纠错",
             Stage::Identify => "声纹辨认",
             Stage::SceneDetect => "场景判断",
             Stage::Summarize => "生成纪要",
@@ -292,6 +295,11 @@ pub struct PipelineOutcome {
     /// 各阶段是否命中缓存(便于验证缓存设计真的生效)
     pub transcript_from_cache: bool,
     pub embeddings_from_cache: bool,
+    /// 纠错情况的说明(未启用或未配置 LLM 时为 None)。
+    ///
+    /// 界面上要显示它 —— "纠错改了 37 段"和"纠错被跳过了"对用户
+    /// 是完全不同的信息,不能都不出声。
+    pub correction_note: Option<String>,
     /// 本次生成/复用的工程目录(None = 未启用工程制)
     pub project_dir: Option<PathBuf>,
 }
@@ -534,6 +542,38 @@ impl<'a> Pipeline<'a> {
             )?;
         }
 
+        // ---------- 转写纠错 ----------
+        //
+        // 放在**说话人区分之后、生成纪要之前**,因为:
+        //
+        // - 声纹辨认依赖音频,与文字无关,先做后做都一样
+        // - 纪要要吃纠错后的文本,否则总结里那些"转写中 X 应为 Y"的
+        //   括号注释就成了打补丁 —— 而用户要的是**转写本身**是对的
+        //
+        // ⚠️ 这一步会**直接改写 transcript 的文本**(用户明确选了这种形式),
+        //    所以 correct.rs 里有一整套"宁可漏改不可错改"的校验。
+        //    时间戳不受影响 —— 只替换 text,不动 start_ms/end_ms。
+        let mut correction_note: Option<String> = None;
+        if self.cfg.enable_term_correction && !transcript.segments.is_empty() {
+            if let Some(sum) = self.summarizer {
+                progress.stage_start(Stage::Correct, 1);
+                progress.check_cancelled()?;
+                let (stats, warns) =
+                    sum.correct_blocking(&mut transcript.segments, &self.cfg.hotwords);
+                crate::llm::correct::rebuild_raw_text(&mut transcript);
+                for w in warns.iter().take(3) {
+                    progress.note(format!("⚠ {w}"));
+                }
+                let line = stats.summary();
+                progress.note(format!("纠错:{line}"));
+                correction_note = Some(line);
+                progress.stage_pct(Stage::Correct, 1.0);
+            } else {
+                // 没配 LLM 就跳过,但要说清楚 —— 否则用户会以为纠错跑了
+                progress.note("跳过纠错(未配置 LLM)");
+            }
+        }
+
         // ---------- 标签 ----------
         let mut labels = self
             .files
@@ -720,6 +760,7 @@ impl<'a> Pipeline<'a> {
             hardware: Some(hw),
             transcript_from_cache: from_cache,
             embeddings_from_cache,
+            correction_note,
             project_dir,
         })
     }

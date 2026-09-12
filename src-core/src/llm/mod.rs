@@ -9,6 +9,7 @@
 //! 3. **prompt 稳定内容前置** —— DeepSeek 有上下文缓存折扣,把系统提示+模板+术语表
 //!    放最前面、转写正文放后面,让前缀缓存能命中。零成本优化。
 
+pub mod correct;
 pub mod cost;
 pub mod keyring;
 pub mod prompt;
@@ -207,8 +208,7 @@ pub struct ChatOutcome {
 }
 
 impl LlmClient {
-    pub fn new(cfg: LlmConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
+    pub fn new(cfg: LlmConfig) -> Result<Self> {        let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
             .context("构建 HTTP 客户端失败")?;
@@ -220,6 +220,19 @@ impl LlmClient {
     }
 
     /// 发一次 chat 请求,带 429/5xx 的退避重试。
+    /// 同步版 chat。
+    ///
+    /// ⚠️ **只在确认调用方没有 runtime 时用。** 管线里更安全的做法是走
+    /// [`BlockingSummarizer::correct_blocking`] —— 它复用已经建好的那个
+    /// runtime,不会嵌套。
+    pub fn chat_blocking(&self, system: &str, user: &str) -> Result<ChatOutcome> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow!("创建 runtime 失败: {e}"))?;
+        rt.block_on(self.chat(system, user))
+    }
+
     pub async fn chat(&self, system: &str, user: &str) -> Result<ChatOutcome> {
         self.cfg.validate()?;
         let key = self.cfg.api_key.clone().unwrap_or_default();
@@ -322,6 +335,21 @@ impl LlmClient {
 
 pub trait Summarizer: Send + Sync {
     fn detect_scene(&self, transcript: &Transcript) -> Result<SceneVerdict>;
+
+    /// 转写纠错(同音字与术语)。见 [`correct`] 模块。
+    ///
+    /// **有默认实现:什么也不做。** 这样 [`MockSummarizer`] 之类的实现
+    /// 不必都去写一遍 —— 而管线里靠"纠错前后文本是否有变化"来判断
+    /// 这一步是否真的生效,不依赖 `Option`。
+    ///
+    /// 真实实现会覆盖它。
+    fn correct_blocking(
+        &self,
+        _segments: &mut [crate::types::Segment],
+        _terms: &[String],
+    ) -> (correct::CorrectionStats, Vec<String>) {
+        (correct::CorrectionStats::default(), Vec::new())
+    }
 
     /// 详细总结:完整结构(知识点 / 例题 / 待办 / 复习提纲)。
     fn summarize(
@@ -431,6 +459,26 @@ impl BlockingSummarizer {
 }
 
 impl Summarizer for BlockingSummarizer {
+    /// 转写纠错。
+    ///
+    /// ⚠️ **必须实现在这个 trait impl 里,不能只在 inherent impl 里。
+    ///
+    /// 我第一版把它写成了 `impl BlockingSummarizer` 下的固有方法,结果管线
+    /// 里 `sum.correct_blocking(...)`(`sum` 是 `&dyn Summarizer`)调的是
+    /// trait 的**默认空实现** —— 编译通过、测试通过、日志显示"纠错:未纠错",
+    /// 而真正的纠错一行没跑。
+    ///
+    /// 这和本项目里反复出现的"死代码"是同一类:代码写了但走不到,
+    /// 而且**没有任何报错**。
+    fn correct_blocking(
+        &self,
+        segments: &mut [crate::types::Segment],
+        terms: &[String],
+    ) -> (correct::CorrectionStats, Vec<String>) {
+        // 复用自己那个 runtime —— 在管线里新建会嵌套(会 panic)
+        correct::correct_with(&self.client, self.rt(), segments, terms)
+    }
+
     fn detect_scene(&self, transcript: &Transcript) -> Result<SceneVerdict> {
         let samples = prompt::scene_samples(transcript);
         let (system, user) = prompt::scene_detect_prompt(&samples);

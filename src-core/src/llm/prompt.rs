@@ -343,9 +343,24 @@ pub fn reduce_prompt(scene: Scene, partials: &[String]) -> (String, String) {
 /// Whisper 在中文上有稳定的同音词错误(知觉/直觉、实效/时效),
 /// 以及专业术语错认(注意力机制 → 注意立即制)。热词注入效果很弱,
 /// 转写后校正才是有效手段,而且成本极低。
+///
+/// # 两条硬要求(都是实测踩出来的)
+///
+/// **① 必须明确要求输出简体。**
+///
+/// 转写那一步靠 `initial_prompt` 里的简体提示压住 Whisper 的繁体偏好,
+/// 但纠错这一步**只送文字**,那个提示不在场。实测:一段繁体转写
+/// (`堅歷視覺…`)纠错后仍然全是繁体。所以在 prompt 里再说一遍。
+///
+/// **② 术语表要说成"权威写法",不能只说"参考"。**
+///
+/// 原来的措辞是"参考术语表(可能出现的正确写法)"。实测 `坚歷視覺`
+/// 本该改成 `计算机视觉`(术语表里有),LLM 却改成了 `建立视觉` ——
+/// 一个读音相近但毫无意义的组合。它把术语表当成了"仅供参考"。
+/// 改成"以此为准"之后才稳定生效。
 pub fn term_correction_prompt(text: &str, terms: &[String]) -> (String, String) {
     let glossary = if terms.is_empty() {
-        "(无术语表)".to_string()
+        "(无)".to_string()
     } else {
         terms.join("、")
     };
@@ -356,8 +371,10 @@ pub fn term_correction_prompt(text: &str, terms: &[String]) -> (String, String) 
          2. **不要删除任何内容**,包括口语重复和语气词。\n\
          3. **不要添加任何新内容**,不要补充解释。\n\
          4. 拿不准的地方保持原样,宁可不改。\n\
-         5. 只输出修正后的文本,不要任何说明文字。\n\n\
-         参考术语表(可能出现的正确写法):{glossary}"
+         5. **必须输出简体中文。** 即使原文是繁体,也要转成简体。\n\
+         6. 只输出修正后的文本,不要任何说明文字。\n\n\
+         术语表(这些是**权威写法**。原文里凡出现读音相近、但写法不在表内的\n\
+         词,一律改成表中的写法):{glossary}"
     );
     let user = format!("待校对文本:\n\n{text}");
     (system, user)
@@ -876,7 +893,33 @@ mod tests {
     #[test]
     fn term_correction_handles_empty_glossary() {
         let (system, _) = term_correction_prompt("文本", &[]);
-        assert!(system.contains("无术语表"));
+        assert!(system.contains("(无)"), "{system}");
+    }
+
+    /// ★ 回归测试:纠错必须**明确要求输出简体**。
+    ///
+    /// 转写那步靠 `initial_prompt` 里的简体提示压住 Whisper 的繁体偏好,
+    /// 但纠错只送文字,那个提示不在场。实测一段繁体转写纠错后仍然是繁体 ——
+    /// 所以这条约束必须写在纠错 prompt 自己里。
+    #[test]
+    fn term_correction_demands_simplified_chinese() {
+        let (system, _) = term_correction_prompt("文本", &[]);
+        assert!(system.contains("简体"), "必须要求简体:{system}");
+    }
+
+    /// ★ 回归测试:术语表要说成**权威写法**。
+    ///
+    /// 原来写的是"参考术语表(可能出现的正确写法)"。实测 `坚歷視覺`
+    /// 本该改成 `计算机视觉`(表里有),LLM 却改成了 `建立视觉` ——
+    /// 一个读音相近但无意义的组合。它把术语表当成了"仅供参考"。
+    #[test]
+    fn term_correction_makes_glossary_authoritative() {
+        let (system, _) = term_correction_prompt("文本", &["计算机视觉".into()]);
+        assert!(system.contains("计算机视觉"), "术语应出现在 prompt 里");
+        assert!(
+            system.contains("权威") || system.contains("以此为准") || system.contains("一律改"),
+            "术语表必须被说成权威写法,而不是仅供参考:{system}"
+        );
     }
 
     // --- 简略总结 ----------------------------------------------------------
