@@ -33,7 +33,8 @@ projects/2026-09-11_高等数学第12讲/
 
 | | |
 |---|---|
-| **转写在本机** | whisper.cpp sidecar。音频不出机器,零调用成本,可离线 |
+| **转写在本机** | 音频不出机器,零调用成本,可离线 |
+| **两个转写引擎** | whisper.cpp(快)或 CrispASR/FireRedASR2(中文更准,慢 6 倍),按需切换 |
 | **自动选后端** | 按 `CUDA → Vulkan → CPU` 顺序探测,不预设你有什么硬件 |
 | **说话人区分** | sherpa-onnx 离线聚类 + 段落级重叠投票,可手动指定人数 |
 | **声纹档案** | 同一个人第二次出现时自动认出;三级匹配(确认/待定/新建)让错误可见 |
@@ -54,6 +55,21 @@ projects/2026-09-11_高等数学第12讲/
 理由都来自实测,详细论证见技术方案。
 
 **whisper.cpp 走 sidecar 子进程,不走 FFI。** 换后端只需换一个 exe 路径;子进程崩溃带不走 GUI;不同后端的构建产物互不干扰。代价是进程启动开销,对分钟级音频可以忽略。
+
+**中文精度不够时,换引擎而不是调参数。** 实测同一段口音较重的课堂录音,whisper large-v3 与 [CrispASR](https://github.com/CrispStrobe/CrispASR) 的 FireRedASR2-AED:
+
+| 内容 | whisper large-v3 | FireRedASR2-AED |
+|---|---|---|
+| 相声 | `说下手` ❌ | **`相声`** ✅ |
+| 逗哏 | `逗评` ❌ | **`逗哏`** ✅ |
+| 捧哏 | `捧本` ❌ | **`捧哏`** ✅ |
+| 计算机 | `这张记忆里` ❌ | **`计算机`** ✅ |
+| `I = F(X, Y)` | `f等于fx` ❌ | **`I等于F X Y`** ✅ |
+| **5 分钟耗时** | **19.8 秒** | 120 秒(慢 6 倍) |
+
+**注意 whisper 更大(1550M vs 1100M)却输了。** 决定性的不是参数量,是**分给中文的容量**:whisper 把 1550M 摊到 99 种语言,还要额外承担自回归解码的复杂度;FireRedASR2 把 1100M 几乎全押在中文上,并用更省参数的 CTC 结构。
+
+所以引擎是**可选**的:默认 whisper(2 小时录音约 10 分钟),重要录音或口音重时切 FireRedASR2(约 50 分钟)。
 
 **说话人区分用 sherpa-onnx,不用 pyannote。** 后者要带一个 Python 运行时,而这是要分发给普通用户的桌面程序。
 
@@ -129,9 +145,14 @@ curl.exe -L -o models/ggml-base.bin "$base/ggml-base.bin"
 # small(465 MB,CPU 推荐档,质量明显更好)
 curl.exe -L -o models/ggml-small.bin "$base/ggml-small.bin"
 
-# large-v3-turbo(1549 MB,GPU 上用这个)
+# large-v3-turbo(1549 MB)—— 快,GPU 上默认用它
 curl.exe -L -o models/ggml-large-v3-turbo.bin "$base/ggml-large-v3-turbo.bin"
+
+# large-v3(2952 MB)—— 慢约 1.6 倍但中文明显更准
+curl.exe -L -o models/ggml-large-v3.bin "$base/ggml-large-v3.bin"
 ```
+
+**`turbo` 是 `large-v3` 的蒸馏版**(809M vs 1550M 参数,只有一半)。中文场景下差别是实的 —— 实测同一段 2 小时录音,`坚立视觉` 之类的错误在 turbo 里出现 8 次,在 large-v3 里 **0 次**。
 
 说话人区分还需要两个 ONNX 模型(共 43 MB),见[技术方案 §7](docs/技术方案.md)。
 
@@ -139,9 +160,45 @@ curl.exe -L -o models/ggml-large-v3-turbo.bin "$base/ggml-large-v3-turbo.bin"
 
 放到 `binaries/<后端>/whisper-cli.exe`,例如 `binaries/cpu/`。**需要与 exe 同目录的 DLL**(`whisper.dll`、`ggml*.dll`)。
 
+CUDA 版还要 `cudart64_12.dll` / `cublas64_12.dll` / `cublasLt64_12.dll`。
+
 编译方法见[编译 whisper.cpp](#编译-whispercpp)。
 
-### 4. 前端依赖
+### 4. 中文引擎(可选)
+
+默认的 whisper 在中文上够用但不算最优。要更高精度就装 CrispASR:
+
+```powershell
+# ① 二进制(约 136 MB)。用 -non-cuda 包是因为 CUDA 运行时 DLL
+#    已经随 whisper.cpp 的 CUDA 版放在 binaries/cuda/ 了
+curl.exe -L -o binaries\crispasr\crispasr.zip `
+  https://github.com/CrispStrobe/CrispASR/releases/download/v0.8.32/crispasr-windows-x86_64-cuda-non-cuda.zip
+Expand-Archive binaries\crispasr\crispasr.zip -DestinationPath binaries\crispasr
+
+# ② 把 CUDA 运行时 DLL 拷进 CrispASR 目录(保持它自包含)
+Copy-Item binaries\cuda\cudart64_12.dll,binaries\cuda\cublas64_12.dll,binaries\cuda\cublasLt64_12.dll binaries\crispasr\crispasr-windows-*\ -Force
+
+# ③ 模型(919 MB)
+curl.exe -L -o models\firered\firered-asr2-aed-q4_k.gguf `
+  https://hf-mirror.com/cstr/firered-asr2-aed-GGUF/resolve/main/firered-asr2-aed-q4_k.gguf
+
+# ④ 标点模型(55 MB)。默认从 huggingface.co 下载,那个域名在国内不通,
+#    所以手动从镜像取到它期望的位置
+curl.exe -L -o "$env:USERPROFILE\.cache\crispasr\fireredpunc-q4_k.gguf" `
+  https://hf-mirror.com/cstr/fireredpunc-GGUF/resolve/main/fireredpunc-q4_k.gguf
+```
+
+装好后:
+
+```powershell
+rs run 录音.m4a --engine firered --term "计算机视觉,双边滤波"
+```
+
+GUI 里「处理录音」页有「转写引擎」下拉框,默认 `whisper(快)`。
+
+**不用 CrispASR 也不影响其他功能** —— 它是独立的 exe,只在选中对应引擎时才去找。
+
+### 5. 前端依赖
 
 思维导图用 mermaid(5.4 MB),不进版本库:
 
@@ -152,7 +209,7 @@ curl.exe -L --ssl-no-revoke -o ui\vendor\mermaid.min.js `
 
 **没有它程序照常运行** —— 只是思维导图标签页会降级显示文本大纲,并在状态栏说明原因。
 
-### 5. 配置 LLM
+### 6. 配置 LLM
 
 不配也能用:会完成转写和说话人区分,只是没有总结和思维导图。
 
@@ -163,7 +220,7 @@ curl.exe -L --ssl-no-revoke -o ui\vendor\mermaid.min.js `
 
 API Key 与 WebDAV 密码都存在**系统凭据管理器**,不写进任何配置文件。
 
-### 6. 跑一段录音
+### 7. 跑一段录音
 
 ```powershell
 .\target\debug\rs.exe run 录音.m4a --language zh --print
@@ -316,6 +373,8 @@ recording-summary/
 ├─ scripts/cargo.ps1       MSVC 环境包装(推荐用它构建)
 ├─ src-core/               全部业务逻辑
 │   ├─ asr.rs              whisper.cpp sidecar
+│   ├─ asr.rs              whisper.cpp sidecar
+│   ├─ asr_crisp.rs        CrispASR sidecar(FireRedASR2 / Qwen3-ASR / …)
 │   ├─ diarize.rs          说话人聚类
 │   ├─ sherpa.rs           sherpa-onnx 接入
 │   ├─ hardware.rs         后端探测与降级链
@@ -336,7 +395,7 @@ recording-summary/
 └─ ui/                     前端(原生 JS,无框架)
 ```
 
-约 19900 行 Rust + 3000 行前端,**508 个测试**。
+约 20600 行 Rust + 3000 行前端,**525 个测试**。
 
 ---
 
@@ -360,7 +419,7 @@ rs config data-dir move D:\RecordingSummary
 ```powershell
 .\scripts\cargo.ps1 build            # debug
 .\scripts\cargo.ps1 build --release  # release
-.\scripts\cargo.ps1 test             # 508 个测试
+.\scripts\cargo.ps1 test             # 525 个测试
 ```
 
 ### 编译 whisper.cpp
@@ -402,6 +461,12 @@ CUDA 版有三个卡点(详见技术方案 §16.5):
 - **说话人区分没在真实多人录音上验证过。** 开发时只有 TTS 合成语音,单一音色会被切成多个虚假说话人。真实录音下的准确率未知。
 - **Vulkan 后端未编译。** 代码路径存在,但 `binaries/vulkan/` 是空的。
 - **说话人区分的耗时未充分评估。** 2 小时 18 分的录音在 CUDA 上转写约 6 分钟,而说话人区分要跑更久(它要处理全部音频的声纹嵌入)。超长录音建议先跳过它。
+- **CrispASR 引擎比 whisper 慢约 6 倍。** 2 小时录音 whisper 约 10 分钟、FireRedASR2 约 50 分钟(它的解码器跑在 CPU 上)。
+- **CrispASR 用不了 `--vad` 和 `--chunk-seconds 0`。** v0.8.32 上这两个都会 2 秒跑完、零输出,只能用默认的 30 秒切片。
+- **CrispASR 有已知的时间戳顺序问题**(它自己的 issue #356)。会报
+  `transcript is not in time order after slice merge`,影响 SRT 的分段。
+- **CrispASR 的中英混说未充分验证。** 它官方声明支持 code-switching,但我们的实测里
+  中英混说那一项是它唯一没赢过 whisper 的地方。
 
 ### 已经验证过的
 
@@ -409,7 +474,9 @@ CUDA 版有三个卡点(详见技术方案 §16.5):
   过程中发现并修掉了三个只有真实服务器才能暴露的问题 —— 认证头缺失、路径未做百分号编码(中文路径 409)、
   以及云端目录树的两处组装错误。
 - **2 小时 18 分的真实课堂录音**:转写 2358 段、详细总结 18 KB、思维导图正常。
-- **437 → 508 个测试**,覆盖选择规则、清单合并、状态判定、路径编码、树组装、路径安全、删除语义、纠错安全。
+- **两个引擎的对照实测**(同一段 5 分钟真实录音,逐项核对):见上面「几个不显然的技术选择」里的对比表。
+- **转写纠错**:用 5 个预埋错误的合成音频 + 一段繁体转写验证,5 处全部纠正、繁体转简体。
+- **437 → 525 个测试**,覆盖选择规则、清单合并、状态判定、路径编码、树组装、路径安全、删除语义、纠错安全、引擎选择。
 
 ---
 
