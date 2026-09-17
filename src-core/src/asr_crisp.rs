@@ -95,10 +95,25 @@ impl CrispBackend {
 /// {
 ///   "crispasr": { "backend": "firered-asr", ... },
 ///   "transcription": [
-///     { "offsets": { "from": 0, "to": 30000 }, "text": "…" }
+///     { "offsets": { "from": 0, "to": 30000 }, "text": "…", "chunk_id": 0 }
 ///   ]
 /// }
 /// ```
+///
+/// # 为什么偏移是 `i64` 不是 `u64`
+///
+/// **实测:v0.8.32 会输出负偏移。** 每个 30 秒切片的**首段** `from` 都是
+/// `-10`(对应它自己的 issue #356 —— 合并切片后时间戳不单调)。真实输出:
+///
+/// ```json
+/// { "offsets": { "from": 0,   "to": 28600 }, "chunk_id": 0 }
+/// { "offsets": { "from": -10, "to": 56000 }, "chunk_id": 1 }
+/// { "offsets": { "from": -10, "to": 82100 }, "chunk_id": 2 }
+/// ```
+///
+/// 用 `u64` 时 serde 直接报 `invalid value: integer -10, expected u64`,
+/// **整次转写作废** —— 而它其实只差 10 毫秒。这个错误在 2 小时录音上
+/// 才暴露(短片段的第一个切片 `from` 恰好是 0,躲过了)。
 #[derive(Debug, Deserialize)]
 struct CrispJson {
     #[serde(default)]
@@ -111,14 +126,17 @@ struct CrispSeg {
     offsets: CrispOffsets,
     #[serde(default)]
     text: String,
+    /// 切片序号。在偏移不可信时用来恢复先后顺序。
+    #[serde(default)]
+    chunk_id: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct CrispOffsets {
     #[serde(default)]
-    from: u64,
+    from: i64,
     #[serde(default)]
-    to: u64,
+    to: i64,
 }
 
 /// 找 CrispASR 的可执行文件。
@@ -377,17 +395,7 @@ impl Transcriber for CrispAsrSidecar {
         let parsed: CrispJson = serde_json::from_str(&text)
             .with_context(|| format!("解析 crispasr JSON 失败: {}", json_path.display()))?;
 
-        let segments: Vec<Segment> = parsed
-            .transcription
-            .into_iter()
-            .filter_map(|s| {
-                let t = s.text.trim().to_string();
-                if t.is_empty() {
-                    return None;
-                }
-                Some(Segment::new(s.offsets.from, s.offsets.to, t))
-            })
-            .collect();
+        let segments = normalize_segments(parsed.transcription);
 
         if segments.is_empty() {
             return Err(anyhow!("crispasr 输出里没有有效段落"));
@@ -419,6 +427,105 @@ fn parse_slice_total(line: &str) -> Option<usize> {
     let rest = &line[i + "processing ".len()..];
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// 把 CrispASR 的原始段落清理成可用的 [`Segment`]。
+///
+/// # CrispASR v0.8.32 的偏移有两个实测问题
+///
+/// **① 每个切片的 `from` 都是垃圾值。**
+/// 实测 30 秒切片的**首段** `from` 恒为 `-10`(对应它自己的 issue #356)。
+/// 直接钳到 0 会让**所有段的时间戳都变成 0** —— 时间轴就没了。
+///
+/// **② `to` 是可靠的,而且能定段。**
+/// 它是**全局累积位置**:60 秒音频的最后一段 `to=60000`,
+/// 5 分钟的最后一段 `to=299960`。相邻两段的 `to` 之差就是前一段的时长。
+///
+/// # 重建办法
+///
+/// ```text
+/// seg[0].start = 0
+/// seg[i].start = seg[i-1].end      ← 前一段的结束就是本段的开始
+/// seg[i].end   = to[i]
+/// ```
+///
+/// 这是**推导**而不是它的原始输出 —— 但对"哪句话在几分钟处"够用,
+/// 而且单调递增(原始 `to` 序列本身单调,前面那段负偏移警告正是
+/// 因为 `from` 破坏了单调性)。
+///
+/// # 兜底:畸形数据不产生垃圾时间轴
+///
+/// 如果某个 `to` 反而不递增(数据损坏),**整批退化成按文本长度比例分配**
+/// —— 时间不精确但单调、且总长对得上。宁可给个诚实的近似,
+/// 也不要给一段明显错乱的时间轴。
+fn normalize_segments(raw: Vec<CrispSeg>) -> Vec<Segment> {
+    // 先按 chunk_id 恢复顺序(原始顺序本来就对,但显式一点)
+    let mut items: Vec<(Option<u32>, usize, CrispSeg)> = raw
+        .into_iter()
+        .enumerate()
+        .filter(|(_, s)| !s.text.trim().is_empty())
+        .map(|(i, s)| (s.chunk_id, i, s))
+        .collect();
+
+    let has_all_ids = items.iter().all(|(c, _, _)| c.is_some());
+    if has_all_ids {
+        items.sort_by_key(|(c, i, _)| (c.unwrap(), *i));
+    }
+
+    // 收集 (end, text)
+    let ends: Vec<u64> = items
+        .iter()
+        .map(|(_, _, s)| s.offsets.to.max(0) as u64)
+        .collect();
+
+    // 检查 ends 是否严格递增 —— 不递增就走兜底
+    let monotonic = ends.windows(2).all(|w| w[1] > w[0]) && ends.iter().all(|&e| e > 0);
+
+    if !monotonic {
+        return distribute_by_length(&items);
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    let mut prev_end = 0u64;
+    for ((_, _, seg), end) in items.into_iter().zip(ends) {
+        let start = prev_end;
+        let text = seg.text.trim().to_string();
+        // 零时长的段(理论上不会有,因为上面校验了递增)跳过
+        if end > start {
+            out.push(Segment::new(start, end, text));
+        }
+        prev_end = end;
+    }
+    out
+}
+
+/// 兜底:时间戳不可信时,按文本长度把总时长按比例分给各段。
+///
+/// 时间不精确,但**单调、总长对得上**,不会给出明显错乱的时间轴。
+fn distribute_by_length(items: &[(Option<u32>, usize, CrispSeg)]) -> Vec<Segment> {
+    let total_ms = items
+        .iter()
+        .map(|(_, _, s)| s.offsets.to.max(0) as u64)
+        .max()
+        .unwrap_or(0);
+    if total_ms == 0 || items.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<usize> = items
+        .iter()
+        .map(|(_, _, s)| s.text.trim().chars().count().max(1))
+        .collect();
+    let total_chars: usize = chars.iter().sum();
+
+    let mut out = Vec::with_capacity(items.len());
+    let mut cursor = 0u64;
+    for ((_, _, seg), n) in items.iter().zip(chars.iter()) {
+        let share = (*n as f64 / total_chars as f64 * total_ms as f64).round() as u64;
+        let end = (cursor + share.max(1)).min(total_ms);
+        out.push(Segment::new(cursor, end, seg.text.trim().to_string()));
+        cursor = end;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -466,8 +573,8 @@ mod tests {
           "transcription": [
             { "timestamps": {"from":"00:00:00,000","to":"00:00:30,000"},
               "offsets": {"from": 0, "to": 30000},
-              "text": "第一段" },
-            { "offsets": {"from": 30000, "to": 60000}, "text": "第二段" }
+              "text": "第一段", "chunk_id": 0 },
+            { "offsets": {"from": 30000, "to": 60000}, "text": "第二段", "chunk_id": 1 }
           ]
         }"#;
         let j: CrispJson = serde_json::from_str(raw).unwrap();
@@ -475,6 +582,206 @@ mod tests {
         assert_eq!(j.transcription[0].offsets.from, 0);
         assert_eq!(j.transcription[0].offsets.to, 30000);
         assert_eq!(j.transcription[1].text, "第二段");
+        assert_eq!(j.transcription[0].chunk_id, Some(0));
+    }
+
+    /// ★ 回归测试:**负偏移必须能解析**。
+    ///
+    /// 实测 v0.8.32 每个 30 秒切片的**首段** `from` 都是 `-10`
+    /// (issue #356,切片合并后时间戳不单调)。原来 `from` 声明成 `u64`,
+    /// serde 直接报 `invalid value: integer -10, expected u64` ——
+    /// **2 小时录音整次转写作废**,而它只差 10 毫秒。
+    ///
+    /// 短片段躲过了这个 bug:只有第一个切片时 `from` 恰好是 0。
+    #[test]
+    fn parses_negative_offsets_from_real_output() {
+        // 真实输出片段(每个切片首段都是 -10)
+        let raw = r#"{
+          "crispasr": { "backend": "firered-asr" },
+          "transcription": [
+            { "offsets": {"from": 0,   "to": 28600},  "text": "第一片", "chunk_id": 0 },
+            { "offsets": {"from": -10, "to": 56000},  "text": "第二片", "chunk_id": 1 },
+            { "offsets": {"from": -10, "to": 82100},  "text": "第三片", "chunk_id": 2 }
+          ]
+        }"#;
+        let j: CrispJson = serde_json::from_str(raw)
+            .expect("负偏移必须能解析 —— 这正是 2 小时录音失败的原因");
+        assert_eq!(j.transcription[1].offsets.from, -10);
+
+        let segs = normalize_segments(j.transcription);
+        assert_eq!(segs.len(), 3);
+        // ★ 关键:start 用**前一段的 end** 重建,不是把负值钳成 0。
+        //   钳成 0 会让所有段的时间戳都是 0 —— 时间轴就没了。
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 28600);
+        assert_eq!(segs[1].start_ms, 28600, "应接续前一段,而不是 0");
+        assert_eq!(segs[1].end_ms, 56000);
+        assert_eq!(segs[2].start_ms, 56000);
+        assert_eq!(segs[2].end_ms, 82100);
+        // 单调递增 —— 这正是原始数据因为负 from 而破坏的性质
+        for w in segs.windows(2) {
+            assert!(w[0].end_ms <= w[1].start_ms, "时间轴必须单调");
+        }
+    }
+
+    #[test]
+    fn normalize_orders_by_chunk_id_not_by_offset() {
+        // 按 from 排序会把负偏移的片段全挤到前面 —— 那是错的。
+        // chunk_id 才是可靠的先后依据。
+        let raw = vec![
+            CrispSeg {
+                offsets: CrispOffsets { from: 0, to: 1000 },
+                text: "甲".into(),
+                chunk_id: Some(0),
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: -10, to: 2000 },
+                text: "乙".into(),
+                chunk_id: Some(1),
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: -10, to: 3000 },
+                text: "丙".into(),
+                chunk_id: Some(2),
+            },
+        ];
+        let segs = normalize_segments(raw);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["甲", "乙", "丙"], "应按 chunk_id 保序");
+    }
+
+    #[test]
+    fn normalize_drops_empty_segments_and_keeps_valid_ones() {
+        let raw = vec![
+            CrispSeg {
+                offsets: CrispOffsets { from: 0, to: 0 },
+                text: "   ".into(),
+                chunk_id: None,
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: 100, to: 200 },
+                text: "甲".into(),
+                chunk_id: None,
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: 200, to: 400 },
+                text: "乙".into(),
+                chunk_id: None,
+            },
+        ];
+        let segs = normalize_segments(raw);
+        // 空文本的丢掉;剩下两段的 to 递增,所以走重建路径
+        assert_eq!(segs.len(), 2, "空文本应被丢弃:{segs:?}");
+        assert_eq!(segs[0].text, "甲");
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 200);
+        assert_eq!(segs[1].text, "乙");
+        assert_eq!(segs[1].start_ms, 200);
+        assert_eq!(segs[1].end_ms, 400);
+    }
+
+    /// `to` 不单调时(**数据损坏**)不能产出错乱的时间轴。
+    ///
+    /// 退化成按文本长度比例分配:时间不精确,但单调、总长对得上。
+    /// 宁可给个诚实的近似,也不要把明显错乱的时间轴交给下游。
+    #[test]
+    fn falls_back_to_proportional_split_when_offsets_are_corrupt() {
+        let raw = vec![
+            CrispSeg {
+                offsets: CrispOffsets { from: 0, to: 5000 },
+                text: "一二三四五".into(), // 5 字
+                chunk_id: None,
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: 0, to: 3000 }, // ← 倒退了
+                text: "一二三五".into(), // 4 字
+                chunk_id: None,
+            },
+        ];
+        let segs = normalize_segments(raw);
+        assert_eq!(segs.len(), 2);
+        // 总时长取最大值 5000,按 5:4 分
+        assert_eq!(segs[0].start_ms, 0);
+        assert!(segs[0].end_ms > 0, "第一段应有正时长");
+        assert_eq!(segs[1].start_ms, segs[0].end_ms, "必须接续");
+        assert_eq!(segs[1].end_ms, 5000, "总长应等于最大 to");
+    }
+
+    #[test]
+    fn normalize_recovers_no_duration_from_negative_range() {
+        // from 比 to 更负时,钳制后可能变成零时长 —— 该丢
+        let raw = vec![CrispSeg {
+            offsets: CrispOffsets { from: -500, to: -100 },
+            text: "整段都是负的".into(),
+            chunk_id: None,
+        }];
+        assert!(normalize_segments(raw).is_empty());
+    }
+
+    #[test]
+    fn normalize_keeps_order_when_chunk_ids_missing() {
+        // 没有 chunk_id 就保持原序(CrispASR 本来就按切片顺序输出)
+        let raw = vec![
+            CrispSeg {
+                offsets: CrispOffsets { from: 0, to: 1000 },
+                text: "一".into(),
+                chunk_id: None,
+            },
+            CrispSeg {
+                offsets: CrispOffsets { from: 1000, to: 2000 },
+                text: "二".into(),
+                chunk_id: None,
+            },
+        ];
+        let segs = normalize_segments(raw);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["一", "二"]);
+    }
+
+    /// ★ 用**捕获自真实运行**的完整 JSON 做真值测试。
+    ///
+    /// 前面那些测试用的手写样本,而这一个用的是 v0.8.32 在 5 分钟真实
+    /// 课堂录音上的原始输出(截取)。它同时覆盖两个实测问题:
+    /// `from = -10`,以及 `to` 是全局累积位置。
+    ///
+    /// 加它是因为:手写样本能过,真实数据却出 0 时间轴 ——
+    /// 说明我的样本没覆盖真实形状。
+    #[test]
+    fn reconstructs_timeline_from_real_captured_json() {
+        let raw = r#"{
+          "crispasr": { "backend": "firered-asr", "model": "x.gguf", "language": "zh" },
+          "transcription": [
+            { "timestamps": {"from":"00:00:00,000","to":"00:00:28,600"},
+              "offsets": {"from": 0,   "to": 28600},  "text": "第一段", "chunk_id": 0 },
+            { "timestamps": {"from":"00:00:00,-10","to":"00:00:56,000"},
+              "offsets": {"from": -10, "to": 56000},  "text": "第二段", "chunk_id": 1 },
+            { "timestamps": {"from":"00:00:00,-10","to":"00:01:22,100"},
+              "offsets": {"from": -10, "to": 82100},  "text": "第三段", "chunk_id": 2 },
+            { "timestamps": {"from":"00:00:00,-10","to":"00:01:48,790"},
+              "offsets": {"from": -10, "to": 108790}, "text": "第四段", "chunk_id": 3 }
+          ]
+        }"#;
+        let j: CrispJson = serde_json::from_str(raw).unwrap();
+        let segs = normalize_segments(j.transcription);
+
+        assert_eq!(segs.len(), 4);
+        // 每一段都必须有正时长 —— 不能全是 0
+        for (i, s) in segs.iter().enumerate() {
+            assert!(
+                s.duration_ms() > 0,
+                "第 {i} 段时长为 0:{:?}",
+                (s.start_ms, s.end_ms)
+            );
+        }
+        // 必须首尾相接、单调递增
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 28600);
+        assert_eq!(segs[1].start_ms, 28600);
+        assert_eq!(segs[1].end_ms, 56000);
+        assert_eq!(segs[2].start_ms, 56000);
+        assert_eq!(segs[3].end_ms, 108790);
+        // 总长等于最后一段的 to
+        assert_eq!(segs.last().unwrap().end_ms, 108790);
     }
 
     #[test]
