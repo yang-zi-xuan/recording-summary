@@ -229,6 +229,12 @@ pub struct SyncReport {
     pub failed: Vec<(String, String)>,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    /// 同步后自动修复了元数据的工程目录数。
+    ///
+    /// 从云端拉下来的目录可能缺 `project.json`(对方还没传,
+    /// 或那次只同步了音频)。缺了它在本地就没有身份,下次处理同一
+    /// 录音会新建重复工程 —— 见 `ProjectStore::repair_all`。
+    pub projects_repaired: usize,
 }
 
 impl SyncReport {
@@ -1198,6 +1204,19 @@ impl<'a> Syncer<'a> {
     pub fn run(&self, progress: &dyn Fn(&str, usize, usize)) -> Result<SyncReport> {
         let mut manifest = Manifest::load_or_new(&self.files.manifest_path())?;
 
+        // ★ 同步前的工程目录快照。
+        //
+        // 结尾的"修复工程结构"只对这个名单生效 —— 否则从云端拉回来的
+        // 文件会给**用户已经删掉的工程**在本地凭空建出目录:
+        // 用户删了工程、选择保留云端副本,一次同步就把它变回来了。
+        // 快照是区分"真需要修"和"不该复活"的唯一依据。
+        let dirs_before = self
+            .files
+            .root()
+            .parent()
+            .and_then(|root| crate::project::ProjectStore::new(root).project_dirs().ok())
+            .unwrap_or_default();
+
         // ★ 上传前先拉远端 manifest 合并 —— 这就是单人场景的"锁"
         let remote_manifest = self
             .rt()
@@ -1359,6 +1378,24 @@ impl<'a> Syncer<'a> {
         // 所以这里只记日志,不返回错误。
         if let Err(e) = self.save_state(&sync_state) {
             tracing::warn!("保存 sync-state 失败(界面状态可能显示不准): {e}");
+        }
+
+        // ★ 同步后修复工程目录结构。
+        //
+        // 从云端拉下来的目录可能只有部分文件 —— 对方的 `project.json`
+        // 也许还没传,或者那次同步只带了音频。缺 `project.json` 的目录
+        // 在本地等于**没有身份**(`find` 按 ID 找工程,而 ID 只在那里),
+        // 下次处理同一录音会新建一个重复工程,原目录变成孤儿。
+        //
+        // **只修同步前就存在的目录** —— 见上面 `dirs_before` 的注释。
+        // 修复失败不该让同步算失败:文件已经落地了,结构问题下次再补。
+        if let Some(root) = self.files.root().parent() {
+            let store = crate::project::ProjectStore::new(root);
+            match store.repair_all(Some(&dirs_before)) {
+                Ok(0) => {}
+                Ok(n) => report.projects_repaired = n,
+                Err(e) => tracing::warn!("同步后修复工程目录失败: {e}"),
+            }
         }
 
         Ok(report)

@@ -304,7 +304,9 @@ impl ProjectStore {
             if !e.path().is_dir() {
                 continue;
             }
-            if let Ok(Some(p)) = load_project(&e.path()) {
+            // 用 load_or_repair:缺元数据的目录也能被认出来,
+            // 否则它会变成谁都找不到的孤儿(实测踩到过)
+            if let Ok(Some(p)) = self.load_or_repair(&e.path()) {
                 if p.meta.id == id_prefix || p.meta.id.starts_with(id_prefix) {
                     matches.push(p);
                 }
@@ -330,7 +332,8 @@ impl ProjectStore {
             if !e.path().is_dir() {
                 continue;
             }
-            if let Ok(Some(p)) = load_project(&e.path()) {
+            // 同上:列表里也要能看见待自愈的目录
+            if let Ok(Some(p)) = self.load_or_repair(&e.path()) {
                 out.push(p);
             }
         }
@@ -342,8 +345,21 @@ impl ProjectStore {
     ///
     /// **同一音频重复处理会复用同一个工程** —— 因为 `id` 就是内容哈希。
     /// 这条很重要:重跑一次不该产生两个工程。
+    ///
+    /// 复用时会顺手修一个退化的标题:调用方给的 `title` 来自**音频文件名**,
+    /// 而工程目录里的音频固定叫 `recording.m4a`。所以"重新处理已有工程"
+    /// 这条路径上,传来的标题永远是 `recording` —— 实测把
+    /// 「9月11日 计算机视觉」改成了「recording」。
+    /// 只在**当前标题是占位符**时才覆盖,用户自己改过的名字不动。
     pub fn create_or_open(&self, id: &str, title: &str) -> Result<Project> {
-        if let Some(p) = self.find(id)? {
+        if let Some(mut p) = self.find(id)? {
+            if is_placeholder_title(&p.meta.title) && !is_placeholder_title(title) {
+                p.meta.title = title.to_string();
+                p.meta.updated_at = crate::store::db::now_ms();
+                // 目录名不跟着改 —— 那会牵动云端路径。
+                // 想改目录用 `rename`,它会处理同步影响。
+                p.save_meta()?;
+            }
             return Ok(p);
         }
 
@@ -832,6 +848,10 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// 从磁盘读一个工程目录。
+/// 读取一个工程目录的元数据。
+///
+/// **缺失或不完整时会尝试自愈**(见 [`ProjectStore::load_or_repair`])——
+/// 直接 `load_project` 只做严格读取。
 pub fn load_project(dir: &Path) -> Result<Option<Project>> {
     let meta_path = dir.join(META_JSON);
     if !meta_path.is_file() {
@@ -843,6 +863,224 @@ pub fn load_project(dir: &Path) -> Result<Option<Project>> {
         dir: dir.to_path_buf(),
         meta,
     }))
+}
+
+impl ProjectStore {
+    /// 读取工程目录,**必要时把缺失的元数据补出来**。
+    ///
+    /// # 为什么需要自愈
+    ///
+    /// 一个工程目录没有 `project.json` 就等于**没有身份**:
+    /// [`Self::find`] 按 ID 找工程,而 ID 只存在 `project.json` 里。
+    /// 缺了它,`create_or_open` 找不到已有目录,于是**新建一个重复工程**。
+    ///
+    /// 实测踩到过:用户手动把音频放回工程目录(或从云端拉回一个
+    /// 部分同步的目录),目录里只有 `audio/recording.m4a`。
+    /// 重新处理同一份录音时,系统建了个 `2026-09-18_recording`,
+    /// 而原来的 `2026-09-11_...` 变成了谁都认不出的孤儿目录。
+    ///
+    /// # 怎么恢复身份
+    ///
+    /// 工程 ID 就是**音频内容哈希**([`crate::audio::content_hash_of`]),
+    /// 所以只要有音频就能算回来:
+    ///
+    /// 1. `audio/audio.sha256` 里有现成的哈希 → 直接用
+    /// 2. 没有就算一遍(同一音频必然得到同一个 ID)
+    /// 3. 标题从目录名剥掉日期前缀,算不出来就用目录名
+    ///
+    /// **音频也没有的目录不修** —— 没有内容就没有身份可言,
+    /// 那种目录应该由调用方当垃圾清理,不该凭空造一个元数据。
+    pub fn load_or_repair(&self, dir: &Path) -> Result<Option<Project>> {
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        // 正常路径:元数据在,直接读
+        if dir.join(META_JSON).is_file() {
+            return load_project(dir);
+        }
+
+        // ---- 自愈 ----
+        let Some(audio) = audio_path(dir) else {
+            return Ok(None); // 没音频 → 不修
+        };
+
+        // ① 先看有没有记着哈希
+        let hash_file = dir.join(AUDIO_DIR).join("audio.sha256");
+        let id = match std::fs::read_to_string(&hash_file) {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            // ② 没有就现算 —— 同一音频必然得到同一个 ID
+            _ => crate::types::content_hash_of(&audio)
+                .with_context(|| format!("自愈工程元数据时无法计算音频哈希: {}", audio.display()))?,
+        };
+
+        let title = title_from_dir_name(dir);
+        let now = crate::store::db::now_ms();
+        let slug = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| title.clone());
+
+        let mut meta = ProjectMeta {
+            version: 1,
+            id,
+            title,
+            slug,
+            created_at: now,
+            updated_at: now,
+            duration_ms: 0,
+            scene: None,
+            scene_confidence: None,
+            source_path: None,
+            asr_model: None,
+            asr_backend: None,
+            has_speakers: false,
+            speaker_count: 0,
+            artifacts: Artifacts::default(),
+        };
+        // 产物按目录里**实际有什么**填,而不是假设
+        meta.artifacts = Artifacts::detect(dir);
+
+        let p = Project {
+            dir: dir.to_path_buf(),
+            meta,
+        };
+        p.save_meta()?;
+        // 顺手补上哈希文件,下次就不用重算
+        let _ = std::fs::write(&hash_file, p.meta.id.as_bytes());
+        Ok(Some(p))
+    }
+    /// 扫一遍所有工程目录,把缺元数据的补上。
+    ///
+    /// 返回实际修复的目录数。
+    ///
+    /// # 什么时候该调用它
+    ///
+    /// **同步之后**,但要传 `only` 名单(见下)。从云端拉下来的目录可能
+    /// 只有部分文件 —— 对方的 `project.json` 也许还没传,或者那次同步
+    /// 只带了音频。缺 `project.json` 的目录在本地等于**没有身份**
+    /// (`find` 按 ID 找工程,而 ID 只在那里),下次处理同一录音会新建
+    /// 一个重复工程,原目录变成孤儿。
+    ///
+    /// # `only`:只修这些目录
+    ///
+    /// ★ 这个参数是必需的,不是优化。
+    ///
+    /// 无差别地修所有目录会造成一个真实的错误:**用户删掉了本地工程、
+    /// 选择保留云端副本**,而一次同步把云端文件拉回来之后,
+    /// 自愈会给这个已被删除的工程**凭空建出一个本地工程**,
+    /// 于是"我明明删了"变成了"它自己又回来了"。
+    ///
+    /// 所以调用方要记下**同步开始前**就存在的工程目录,只对它们自愈:
+    /// 目录在同步前就在、只是缺元数据 → 是真需要修;
+    /// 目录是这次同步新建的 → 那是一个"云端有、本地主动删掉"的工程,
+    /// 不该在本地复活。
+    ///
+    /// 幂等:已经正常的目录不动。
+    pub fn repair_all(&self, only: Option<&std::collections::HashSet<PathBuf>>) -> Result<usize> {
+        let base = self.projects_dir();
+        if !base.is_dir() {
+            return Ok(0);
+        }
+        let mut fixed = 0;
+        for e in std::fs::read_dir(&base)?.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if let Some(allow) = only {
+                if !allow.contains(&p) {
+                    continue;
+                }
+            }
+            // 缺元数据才修 —— 已有的不碰,免得覆盖用户改过的标题
+            if p.join(META_JSON).is_file() {
+                continue;
+            }
+            if self.load_or_repair(&p)?.is_some() {
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
+    }
+
+    /// 列出所有工程目录(不读元数据,纯路径)。
+    ///
+    /// 同步前调用它做快照,用来区分"同步前就有的目录"和"这次拉下来的"。
+    pub fn project_dirs(&self) -> Result<std::collections::HashSet<PathBuf>> {
+        let base = self.projects_dir();
+        let mut out = std::collections::HashSet::new();
+        if !base.is_dir() {
+            return Ok(out);
+        }
+        for e in std::fs::read_dir(&base)?.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                out.insert(p);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 判断一个标题是不是"占位符"—— 即没有信息量的名字。
+///
+/// 工程目录里的音频固定叫 `recording.m4a`,所以从音频文件名推出来的
+/// 标题永远是 `recording`。这种名字不该覆盖用户真正起过的标题。
+///
+/// 名单故意保守:**只有明确无意义的才当占位符**。宁可漏判
+/// (标题保持 `recording` 这种小瑕疵)也不要误判(把用户起的
+/// 「录音」覆盖掉)。
+fn is_placeholder_title(t: &str) -> bool {
+    let s = t.trim();
+    if s.is_empty() {
+        return true;
+    }
+    const PLACEHOLDERS: &[&str] = &["recording", "audio", "input", "output", "untitled"];
+    let lower = s.to_ascii_lowercase();
+    if PLACEHOLDERS.contains(&lower.as_str()) {
+        return true;
+    }
+    // `recording (2)` `recording_3` 这类
+    if let Some(base) = lower.split([' ', '(', '_', '-']).next() {
+        if PLACEHOLDERS.contains(&base) && base.len() < lower.len() {
+            return true;
+        }
+    }
+    // 纯数字 / 纯哈希
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    false
+}
+
+/// 从目录名推标题:`2026-09-11_9月11日 计算机视觉` → `9月11日 计算机视觉`。///
+/// 剥掉 `YYYY-MM-DD_` 前缀和 `_2` `_3` 这类去重后缀。
+fn title_from_dir_name(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 日期前缀
+    let rest = match name.split_once('_') {
+        Some((date, rest)) if date.len() == 10 && date.chars().filter(|c| *c == '-').count() == 2 => {
+            rest
+        }
+        _ => name.as_str(),
+    };
+    // 去重后缀 `_2`
+    let cleaned = match rest.rsplit_once('_') {
+        Some((base, tail))
+            if !base.is_empty() && tail.len() <= 2 && tail.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => rest,
+    };
+    if cleaned.trim().is_empty() {
+        name
+    } else {
+        cleaned.to_string()
+    }
 }
 
 /// 把一份音频拷进工程目录。
@@ -1593,5 +1831,209 @@ mod tests {
         let out = store.rename("h", "新名字").unwrap();
         assert_eq!(out.old_slug, before);
         assert_ne!(out.old_slug, store.find("h").unwrap().unwrap().meta.slug);
+    }
+
+    // -----------------------------------------------------------------------
+    // 工程目录自愈
+    // -----------------------------------------------------------------------
+
+    /// 造一个"没有 project.json 但有音频"的目录 —— 模拟用户手动放回音频,
+    /// 或从云端同步下来一个不完整的目录。
+    fn orphan_dir(root: &std::path::Path, name: &str, audio_bytes: &[u8]) {
+        let d = root.join("projects").join(name).join("audio");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("recording.m4a"), audio_bytes).unwrap();
+    }
+
+    /// ★ 回归测试:没有 `project.json` 的目录必须能被认出来。
+    ///
+    /// 踩到过的事实:用户把音频放回工程目录后重新处理,
+    /// 系统认不出那个目录(身份只存在 `project.json` 里),
+    /// 于是**新建了一个重复工程**,原目录成了谁都找不到的孤儿。
+    #[test]
+    fn repairs_dir_without_meta_json() {
+        let (d, store) = fixture();
+        orphan_dir(d.path(), "2026-09-11_9月11日 计算机视觉", b"fake-audio-bytes");
+
+        let dir = d
+            .path()
+            .join("projects")
+            .join("2026-09-11_9月11日 计算机视觉");
+        assert!(!dir.join(META_JSON).exists(), "前提:元数据确实缺失");
+
+        let p = store
+            .load_or_repair(&dir)
+            .unwrap()
+            .expect("应该自愈出工程,而不是返回 None");
+
+        // ID 从音频内容哈希算出来 —— 必须是 64 位十六进制
+        assert_eq!(p.meta.id.len(), 64, "ID 应是 sha256:{}", p.meta.id);
+        assert!(p.meta.id.chars().all(|c| c.is_ascii_hexdigit()));
+        // 标题从目录名剥掉日期前缀
+        assert_eq!(p.meta.title, "9月11日 计算机视觉");
+        // 元数据落盘了,下次不用再自愈
+        assert!(dir.join(META_JSON).is_file());
+        // 哈希文件也补上了
+        assert!(dir.join("audio").join("audio.sha256").is_file());
+        // artifacts 反映**实际**内容(只有音频)
+        assert!(p.meta.artifacts.audio);
+        assert!(!p.meta.artifacts.transcript);
+    }
+
+    /// 自愈出来的 ID 必须和正常流程算出的**完全一致** ——
+    /// 否则同一份录音会有两个身份,又变成孤儿。
+    #[test]
+    fn repaired_id_matches_content_hash() {
+        let (d, store) = fixture();
+        orphan_dir(d.path(), "2026-09-11_测试", b"the-same-bytes");
+
+        let dir = d.path().join("projects").join("2026-09-11_测试");
+        let repaired = store.load_or_repair(&dir).unwrap().unwrap();
+
+        let expect = crate::types::content_hash_of(&dir.join("audio").join("recording.m4a")).unwrap();
+        assert_eq!(repaired.meta.id, expect);
+    }
+
+    /// 自愈之后 `find()` 必须能找到它 —— 这才是修复的意义所在。
+    #[test]
+    fn find_sees_repaired_dir() {
+        let (d, store) = fixture();
+        orphan_dir(d.path(), "2026-09-11_测试", b"xx");
+
+        let all = store.list().unwrap();
+        assert_eq!(all.len(), 1, "列表里应该看得见待自愈的目录");
+        let id = all[0].meta.id.clone();
+
+        let found = store.find(&id[..8]).unwrap();
+        assert!(found.is_some(), "按 ID 前缀应该能找到");
+        assert_eq!(found.unwrap().meta.id, id);
+    }
+
+    /// 没有音频的目录不修 —— 没有内容就没有身份,不该凭空造元数据。
+    #[test]
+    fn does_not_repair_dir_without_audio() {
+        let (d, store) = fixture();
+        let dir = d.path().join("projects").join("2026-09-11_空目录");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(store.load_or_repair(&dir).unwrap().is_none());
+        assert!(!dir.join(META_JSON).exists(), "不该凭空写下元数据");
+    }
+
+    /// 已经正常的工程不该被自愈改动。
+    #[test]
+    fn repair_is_a_noop_for_healthy_project() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("hash-abc", "正常工程").unwrap();
+        let before = p.meta.clone();
+
+        let again = store.load_or_repair(&p.dir).unwrap().unwrap();
+        assert_eq!(again.meta.id, before.id);
+        assert_eq!(again.meta.title, before.title);
+        assert_eq!(again.meta.created_at, before.created_at, "不该刷新创建时间");
+    }
+
+    #[test]
+    fn title_from_dir_name_strips_date_and_dedup_suffix() {
+        let f = |s: &str| title_from_dir_name(std::path::Path::new(s));
+        assert_eq!(f("2026-09-11_9月11日 计算机视觉"), "9月11日 计算机视觉");
+        assert_eq!(f("2026-09-11_测试_2"), "测试");
+        assert_eq!(f("2026-09-11_测试_10"), "测试");
+        // 不像日期的前缀不动
+        assert_eq!(f("我的录音"), "我的录音");
+        assert_eq!(f("abc_def"), "abc_def");
+        // 只有日期没有标题时,退回整个目录名,不该给出空标题
+        assert_eq!(f("2026-09-11_"), "2026-09-11_");
+    }
+
+    /// 自愈出的哈希优先用 `audio.sha256` 里记着的 —— 免得对大音频重算一遍。
+    #[test]
+    fn repair_prefers_recorded_hash_over_recomputing() {
+        let (d, store) = fixture();
+        let dir = d.path().join("projects").join("2026-09-11_测试");
+        let adir = dir.join("audio");
+        std::fs::create_dir_all(&adir).unwrap();
+        std::fs::write(adir.join("recording.m4a"), b"real-bytes").unwrap();
+        // 写一个**不同于**真实哈希的值,看它是否被采纳
+        let fake = "f".repeat(64);
+        std::fs::write(adir.join("audio.sha256"), &fake).unwrap();
+
+        let p = store.load_or_repair(&dir).unwrap().unwrap();
+        assert_eq!(p.meta.id, fake, "应优先采用已记录的哈希");
+    }
+
+    // -----------------------------------------------------------------------
+    // 占位标题
+    // -----------------------------------------------------------------------
+
+    /// ★ 回归测试:重新处理已有工程不该把标题改成 `recording`。
+    ///
+    /// 踩到过的事实:工程目录里的音频固定叫 `recording.m4a`,
+    /// 而标题是从**音频文件名**推的。于是"重跑一次"就把
+    /// 「9月11日 计算机视觉」改成了「recording」。
+    /// 同一音频必然落到同一工程(ID 就是内容哈希),所以这条路径
+    /// 每次重跑都会走到。
+    #[test]
+    fn rerun_does_not_clobber_a_real_title_with_recording() {
+        let (_d, store) = fixture();
+        let p = store.create_or_open("hash-1", "9月11日 计算机视觉").unwrap();
+        assert_eq!(p.meta.title, "9月11日 计算机视觉");
+
+        // 模拟重新处理:标题来自工程内的音频文件名
+        let again = store.create_or_open("hash-1", "recording").unwrap();
+        assert_eq!(
+            again.meta.title, "9月11日 计算机视觉",
+            "占位标题不该覆盖真标题"
+        );
+        assert_eq!(again.dir, p.dir, "也不该新建目录");
+    }
+
+    /// 反过来:标题是占位符时,应该被真标题补上。
+    #[test]
+    fn placeholder_title_gets_upgraded() {
+        let (_d, store) = fixture();
+        store.create_or_open("hash-2", "recording").unwrap();
+        let p = store.create_or_open("hash-2", "真实的课").unwrap();
+        assert_eq!(p.meta.title, "真实的课");
+    }
+
+    /// 用户自己起的名字(哪怕很短)不该被当成占位符。
+    ///
+    /// 名单故意保守:**宁可漏判,不要误判**。
+    #[test]
+    fn real_short_titles_are_not_placeholders() {
+        for t in ["录音", "课堂", "会议", "访谈", "a", "第 3 讲"] {
+            assert!(!is_placeholder_title(t), "「{t}」不该被当占位符");
+        }
+    }
+
+    #[test]
+    fn obvious_placeholders_are_detected() {
+        for t in [
+            "recording",
+            "Recording",
+            "RECORDING",
+            "  recording  ",
+            "audio",
+            "untitled",
+            "recording (2)",
+            "recording_3",
+            "12345",
+            "",
+            "   ",
+        ] {
+            assert!(is_placeholder_title(t), "「{t}」应被当占位符");
+        }
+    }
+
+    /// 两个都是占位符时不来回改 —— 避免每次重跑都写一次元数据。
+    #[test]
+    fn two_placeholders_do_not_thrash() {
+        let (_d, store) = fixture();
+        let a = store.create_or_open("hash-3", "recording").unwrap();
+        let t0 = a.meta.updated_at;
+        let b = store.create_or_open("hash-3", "recording").unwrap();
+        assert_eq!(b.meta.title, "recording");
+        assert_eq!(b.meta.updated_at, t0, "不该反复写元数据");
     }
 }
