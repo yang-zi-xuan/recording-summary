@@ -70,6 +70,194 @@ const $ = (id) => document.getElementById(id);
 const show = (el) => el && el.classList.remove('hidden');
 const hide = (el) => el && el.classList.add('hidden');
 
+// ---------------------------------------------------------------------------
+// 对话框:替换 WebView2 上**静默失效**的内建 alert / confirm / prompt
+// ---------------------------------------------------------------------------
+//
+// ★ 这一整块是必需的,不是锦上添花。
+//
+// 实测(Tauri 2 + WebView2,Windows):`window.confirm` / `window.alert`
+// **存在、能被调用、不抛异常,但什么都不做** —— 不显示对话框,也不返回。
+// 于是 `if (!await confirm(msg)) return;` 永远走进 return,按钮看起来
+// "没反应"。删工程、删声纹档案、恢复同步、开始同步、删云端文件
+// 全都因此失效,而**没有任何错误信息**。
+//
+// 发现它的过程:点「删除」后没弹框,`--diag` 浮层显示
+// `delClicks=1  confirmType=function` —— 处理器跑了、函数也在,
+// 就是没弹窗。这才定位到是 WebView 抑制了内建对话框。
+//
+// 所以这里自己实现三个,并覆盖全局同名函数。**调用点要加 `await`**。
+
+/** 构建一个模态遮罩。返回 { overlay, close }。 */
+function modalShell() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const box = document.createElement('div');
+  box.className = 'modal-box';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  return { overlay, box, close: () => overlay.remove() };
+}
+
+/**
+ * 模态提示。**必须 await。**
+ *
+ * 覆盖内建 `alert`,所以调用点写法不变(但要加 await)。
+ */
+window.alert = function (message) {
+  return new Promise((resolve) => {
+    const { box, close } = modalShell();
+    const body = document.createElement('div');
+    body.className = 'modal-body';
+    // 纯文本,不解析 HTML —— 消息里常有用户输入的路径
+    body.textContent = String(message ?? '');
+    box.appendChild(body);
+
+    const row = document.createElement('div');
+    row.className = 'modal-actions';
+    const ok = document.createElement('button');
+    ok.className = 'btn';
+    ok.textContent = '好';
+    ok.addEventListener('click', () => {
+      close();
+      resolve();
+    });
+    row.appendChild(ok);
+    box.appendChild(row);
+
+    ok.focus();
+    overlayKeyClose(box, () => {
+      close();
+      resolve();
+    });
+  });
+};
+
+/**
+ * 模态确认。**必须 await。** 返回 true/false。
+ *
+ * 覆盖内建 `confirm`,调用点写法不变(但要加 await)。
+ */
+window.confirm = function (message, opts) {
+  const danger = opts && opts.danger;
+  return new Promise((resolve) => {
+    const { box, close } = modalShell();
+    const body = document.createElement('div');
+    body.className = 'modal-body';
+    body.textContent = String(message ?? '');
+    box.appendChild(body);
+
+    const row = document.createElement('div');
+    row.className = 'modal-actions';
+
+    const cancel = document.createElement('button');
+    cancel.className = 'btn ghost';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', () => {
+      close();
+      resolve(false);
+    });
+
+    const ok = document.createElement('button');
+    // 破坏性操作用红色,和「删除」按钮同一套视觉语言
+    ok.className = danger ? 'btn danger-solid' : 'btn';
+    ok.textContent = '确定';
+    ok.addEventListener('click', () => {
+      close();
+      resolve(true);
+    });
+
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    box.appendChild(row);
+
+    ok.focus();
+    // 确认框按 Esc = 取消(更安全的一侧)
+    overlayKeyClose(box, () => {
+      close();
+      resolve(false);
+    });
+  });
+};
+
+/**
+ * 模态输入。**必须 await。** 返回字符串或 null(取消)。
+ *
+ * 覆盖内建 `prompt`,调用点写法不变(但要加 await)。
+ */
+window.prompt = function (message, defaultValue) {
+  return new Promise((resolve) => {
+    const { box, close } = modalShell();
+    const body = document.createElement('div');
+    body.className = 'modal-body';
+    body.textContent = String(message ?? '');
+    box.appendChild(body);
+
+    const inp = document.createElement('input');
+    inp.className = 'modal-input';
+    inp.type = 'text';
+    inp.value = defaultValue == null ? '' : String(defaultValue);
+    box.appendChild(inp);
+
+    const row = document.createElement('div');
+    row.className = 'modal-actions';
+
+    const cancel = document.createElement('button');
+    cancel.className = 'btn ghost';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', () => {
+      close();
+      resolve(null);
+    });
+
+    const ok = document.createElement('button');
+    ok.className = 'btn';
+    ok.textContent = '确定';
+    const done = () => {
+      close();
+      resolve(inp.value);
+    };
+    ok.addEventListener('click', done);
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done();
+      if (e.key === 'Escape') {
+        close();
+        resolve(null);
+      }
+    });
+
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    box.appendChild(row);
+
+    inp.focus();
+    inp.select();
+    overlayKeyClose(box, () => {
+      close();
+      resolve(null);
+    });
+  });
+};
+
+/** Esc 关闭。`cancel` 决定关掉后返回什么。 */
+function overlayKeyClose(box, cancel) {
+  const h = (e) => {
+    if (e.key === 'Escape') {
+      document.removeEventListener('keydown', h, true);
+      cancel();
+    }
+  };
+  document.addEventListener('keydown', h, true);
+  // 节点被移除时顺手清掉监听,避免堆积
+  const obs = new MutationObserver(() => {
+    if (!document.body.contains(box)) {
+      document.removeEventListener('keydown', h, true);
+      obs.disconnect();
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+}
+
 function fmtBytes(n) {
   if (n < 1024) return n + ' B';
   if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
@@ -353,14 +541,14 @@ function setupHtml5Drop() {
       dz.classList.remove('over');
     })
   );
-  dz.addEventListener('drop', (e) => {
+  dz.addEventListener('drop', async (e) => {
     const f = e.dataTransfer.files[0];
     if (!f) return;
     // Tauri 2 的 File 对象没有 path;能拿到就用,拿不到就让用户走文件对话框
     if (f.path) {
       setPicked(f.path);
     } else {
-      alert(
+      await alert(
         '拖放没能拿到文件的完整路径。\n\n' +
           '请点「选择文件」按钮挑选音频 —— 这个方式一定能拿到路径。'
       );
@@ -710,7 +898,7 @@ async function openProject(id) {
     document.querySelectorAll('.view').forEach((x) => x.classList.remove('active'));
     $('view-project').classList.add('active');
   } catch (e) {
-    alert('打开工程失败:' + e);
+    await alert('打开工程失败:' + e);
   }
 }
 
@@ -828,7 +1016,7 @@ $('btnOpenDir').addEventListener('click', async () => {
     }
     // 插件不可用时至少把路径给出来,别让用户什么都拿不到
     await copyToClipboard(dir);
-    alert(
+    await alert(
       '已复制工程目录路径(系统打开接口不可用):\n\n' +
         dir +
         '\n\n可直接粘到资源管理器地址栏。'
@@ -837,7 +1025,7 @@ $('btnOpenDir').addEventListener('click', async () => {
     // 失败时也把路径显示出来 —— 用户至少能自己去找
     const fallback = currentProject ? currentProject.dir : '';
     if (fallback) await copyToClipboard(fallback);
-    alert(
+    await alert(
       '打开目录失败:' +
         e +
         (fallback ? '\n\n路径已复制到剪贴板:\n' + fallback : '')
@@ -853,6 +1041,8 @@ $('btnOpenDir').addEventListener('click', async () => {
  *  "我删了本地,云端那份是不是也没了"。
  */
 $('btnDeleteProject').addEventListener('click', async () => {
+  // 诊断计数器 —— 用来分辨"处理器没被调用"和"confirm 被抑制"
+  window.__DEL_CLICKS = (window.__DEL_CLICKS || 0) + 1;
   if (!currentProject) return;
   const p = currentProject;
 
@@ -865,30 +1055,37 @@ $('btnDeleteProject').addEventListener('click', async () => {
     /* 会话记录不在就不提这一项 */
   }
 
-  const delSource = srcLine
-    ? confirm(
-        '是否**同时删除原始录音**?\n\n' +
-          srcLine +
-          '\n\n' +
-          '· 确定 = 一并删掉(彻底腾出空间)\n' +
-          '· 取消 = 保留(只删工程)\n\n' +
-          '(工程目录里已有一份音频副本,删了原始文件不影响播放)'
-      )
-    : false;
-
+  // ★ 顺序很重要:第一步就是**删除本身的确认**,而不是"要不要删原始录音"。
+  //
+  //   原来的写法先问"是否同时删除原始录音?",取消 = 保留原始录音,
+  //   然后照样进入删除工程那一步。问题在于:用户在第一个框点"取消"时,
+  //   想的是"我不删了",而实际含义是"保留原始录音、继续删工程" ——
+  //   那个框看起来像唯一的退出机会,实际不是。**没有退路了。**
+  //
+  //   现在:第一个框决定"删不删",第二个框才问原始录音。
   const msg =
     `删除这个工程?\n\n` +
     `${p.title}\n\n` +
     `会删掉:\n` +
     `· 工程目录(含音频副本)\n` +
     `· 转写 / 总结 / 说话人标签的缓存文件\n` +
-    (delSource ? `· 原始录音 ${srcLine}\n` : '') +
     `\n**不会删**:\n` +
     `· 历史记录(会保留,并标记为「工程已删除」)\n` +
     `· 云端副本(需要到「云端管理」里单独删)\n` +
     `\n⚠ 本地删除不可撤销。`;
 
-  if (!confirm(msg)) return;
+  if (!(await confirm(msg, { danger: true }))) return;
+
+  // 第二步:原始录音(在应用目录之外,默认保留)
+  const delSource = srcLine
+    ? await confirm(
+        '是否**同时删除原始录音**?\n\n' +
+          srcLine +
+          '\n\n' +
+          '· 确定 = 一并删掉(彻底腾出空间)\n' +
+          '· 取消 = 保留它(只删上面那个工程)'
+      )
+    : false;
 
   try {
     const r = await invoke('delete_project', {
@@ -919,13 +1116,13 @@ $('btnDeleteProject').addEventListener('click', async () => {
         `\n\n⚠ **云端副本还在。**\n` +
         `到「云端同步 → 云端管理」里找到这个工程删掉,云端空间才会释放。`;
     }
-    alert(report);
+    await alert(report);
 
     // 回列表
     gotoView('projects');
     await loadProjects();
   } catch (e) {
-    alert('删除失败:' + e);
+    await alert('删除失败:' + e);
   }
 });
 
@@ -949,7 +1146,7 @@ async function copyToClipboard(text) {
 $('btnRenameProject').addEventListener('click', async () => {
   if (!currentProject) return;
   const oldTitle = currentProject.title;
-  const input = prompt(
+  const input = await prompt(
     '新名字:\n\n' +
       '(标题和文件夹名会一起改。日期前缀会保留。)\n' +
       '(注意:如果这个工程已经同步过,云端路径会跟着变。)',
@@ -958,7 +1155,7 @@ $('btnRenameProject').addEventListener('click', async () => {
   if (input === null) return; // 取消
   const title = input.trim();
   if (!title) {
-    alert('名字不能为空。');
+    await alert('名字不能为空。');
     return;
   }
   if (title === oldTitle) return; // 没变,不折腾
@@ -973,7 +1170,7 @@ $('btnRenameProject').addEventListener('click', async () => {
     await openProject(currentProject.id);
 
     if (r.slug_changed) {
-      alert(
+      await alert(
         '已重命名。\n\n' +
           '标题:' +
           r.old_title +
@@ -991,7 +1188,7 @@ $('btnRenameProject').addEventListener('click', async () => {
       );
     }
   } catch (e) {
-    alert('改名失败:' + e);
+    await alert('改名失败:' + e);
   }
 });
 
@@ -1026,7 +1223,7 @@ $('btnMmSource').addEventListener('click', () => {
 $('btnMmPng').addEventListener('click', async () => {
   const svg = $('mindmapTarget').querySelector('svg');
   if (!svg) {
-    alert('还没有渲染出图,无法导出。');
+    await alert('还没有渲染出图,无法导出。');
     return;
   }
   try {
@@ -1037,9 +1234,9 @@ $('btnMmPng').addEventListener('click', async () => {
     if (!path) return;
     const png = await svgToPngDataUrl(svg);
     await invoke('save_png', { path, dataUrl: png });
-    alert('已导出到\n' + path);
+    await alert('已导出到\n' + path);
   } catch (e) {
-    alert('导出失败:' + e);
+    await alert('导出失败:' + e);
   }
 });
 
@@ -1122,9 +1319,9 @@ $('btnProjSave').addEventListener('click', async () => {
   if (!path) return;
   try {
     await invoke('save_text', { path, content: c });
-    alert('已保存到\n' + path);
+    await alert('已保存到\n' + path);
   } catch (e) {
-    alert('保存失败:' + e);
+    await alert('保存失败:' + e);
   }
 });
 
@@ -1226,7 +1423,7 @@ async function openSession(id) {
     document.querySelectorAll('.view').forEach((x) => x.classList.remove('active'));
     $('view-detail').classList.add('active');
   } catch (e) {
-    alert('打开失败:' + e);
+    await alert('打开失败:' + e);
   }
 }
 
@@ -1267,7 +1464,7 @@ function renderSpeakers(d) {
         // ★ 改名只动标签,不重新转写 —— 所以这里是即时的
         logTo($('progLog'), `已把 [${sid}] 改名为「${inp.value}」`, 'ln-ok');
       } catch (e) {
-        alert('改名失败:' + e);
+        await alert('改名失败:' + e);
       }
     });
   });
@@ -1333,14 +1530,14 @@ $('btnSaveTab').addEventListener('click', async () => {
   if (!path) return;
   try {
     await invoke('save_text', { path, content: c });
-    alert('已保存到\n' + path);
+    await alert('已保存到\n' + path);
   } catch (e) {
-    alert('保存失败:' + e);
+    await alert('保存失败:' + e);
   }
 });
 
-$('btnRegenHint').addEventListener('click', () => {
-  alert(
+$('btnRegenHint').addEventListener('click', async () => {
+  await alert(
     '重新生成纪要的步骤:\n\n' +
     '1. 到「处理录音」\n' +
     '2. 拖入同一个音频文件\n' +
@@ -1387,10 +1584,10 @@ async function loadProfiles() {
         e.stopPropagation();
         const id = b.dataset.id;
         if (b.dataset.act === 'del') {
-          if (!confirm('删除这个档案?包含全部登记样本,不可恢复。')) return;
+          if (!await confirm('删除这个档案?包含全部登记样本,不可恢复。')) return;
           await invoke('delete_profile', { profileId: id });
         } else {
-          const n = prompt('新的名字:', b.dataset.name);
+          const n = await prompt('新的名字:', b.dataset.name);
           if (!n) return;
           await invoke('rename_profile', { profileId: id, name: n });
         }
@@ -1480,7 +1677,7 @@ $('btnScopeSave').addEventListener('click', async () => {
     // 方向/策略变了,清单状态会变 —— 刷新
     await loadInventory(false);
   } catch (e) {
-    alert('保存失败:' + e);
+    await alert('保存失败:' + e);
   }
 });
 
@@ -1637,7 +1834,7 @@ function renderTree() {
         await loadScope();
         await loadInventory(false);
       } catch (e) {
-        alert('修改失败:' + e);
+        await alert('修改失败:' + e);
         cb.checked = !cb.checked;
       } finally {
         cb.disabled = false;
@@ -1675,7 +1872,7 @@ $('btnInvProbe').addEventListener('click', async () => {
 });
 
 $('btnInvClear').addEventListener('click', async () => {
-  if (!confirm('恢复全部同步?这会清空所有「取消勾选」的记录。\n\n不会删除任何文件,只是让它们重新参与同步。')) {
+  if (!await confirm('恢复全部同步?这会清空所有「取消勾选」的记录。\n\n不会删除任何文件,只是让它们重新参与同步。')) {
     return;
   }
   try {
@@ -1684,7 +1881,7 @@ $('btnInvClear').addEventListener('click', async () => {
     await loadScope();
     await loadInventory(false);
   } catch (e) {
-    alert('操作失败:' + e);
+    await alert('操作失败:' + e);
   }
 });
 
@@ -1775,7 +1972,7 @@ $('btnSyncPlan').addEventListener('click', async () => {
 $('btnSyncRun').addEventListener('click', async () => {
   show($('syncLog'));
   const v = syncFormValues();
-  if (!confirm('开始同步?\n\n建议先点「查看同步计划」确认要传什么、要删什么。')) {
+  if (!await confirm('开始同步?\n\n建议先点「查看同步计划」确认要传什么、要删什么。')) {
     return;
   }
   logTo($('syncLog'), `开始同步…(用户 ${v.username || '(空)'})`);
@@ -2005,7 +2202,7 @@ $('cloudTree').addEventListener('click', async (e) => {
     const msg = isDir
       ? `删除云端目录?\n\n${rel}\n\n⚠ 目录里的全部文件和子目录都会一起删掉,不可恢复。`
       : `删除云端文件?\n\n${rel}\n\n⚠ 不可恢复。`;
-    if (!confirm(msg)) return;
+    if (!await confirm(msg)) return;
 
     del.disabled = true;
     del.textContent = '删除中…';
@@ -2018,11 +2215,11 @@ $('cloudTree').addEventListener('click', async (e) => {
       if (r.failed && r.failed.length) {
         line += `\n\n有 ${r.failed.length} 项删不掉:\n` + r.failed.slice(0, 8).join('\n');
       }
-      alert(line);
+      await alert(line);
       // 重新拉一次,让树反映最新状态
       await reloadCloud();
     } catch (err) {
-      alert('删除失败:' + err);
+      await alert('删除失败:' + err);
       del.disabled = false;
       del.textContent = '删除';
     }
@@ -2072,7 +2269,7 @@ async function toggleRow(row, key) {
     updateCaret(row, false);
   } catch (err) {
     updateCaret(row, true);
-    alert('读取这个目录失败:' + err);
+    await alert('读取这个目录失败:' + err);
   }
 }
 
@@ -2103,7 +2300,7 @@ async function doSyncOne(btn) {
   const msg = isUp
     ? `把本地这份传上去?\n\n${rel}\n\n⚠ 云端的同名文件会被覆盖。`
     : `把云端这份拉下来?\n\n${rel}\n\n⚠ 本地的同名文件会被覆盖。`;
-  if (!confirm(msg)) return;
+  if (!await confirm(msg)) return;
 
   const label = btn.textContent;
   btn.disabled = true;
@@ -2117,7 +2314,7 @@ async function doSyncOne(btn) {
   } catch (err) {
     btn.disabled = false;
     btn.textContent = label;
-    alert((isUp ? '上传失败:' : '下载失败:') + err);
+    await alert((isUp ? '上传失败:' : '下载失败:') + err);
   }
 }
 
@@ -2381,6 +2578,8 @@ function fatal(msg) {
         `dragdrop=${d.mode} ready=${d.ready}`,
         `pickedPath=${S.pickedPath || '(未选)'}`,
         `mermaid=${window.mermaid ? 'yes' : 'NO'}`,
+        `delClicks=${window.__DEL_CLICKS || 0}  currentProject=${currentProject ? currentProject.title : 'NULL'}`,
+        `confirmType=${typeof window.confirm}`,
       ].join('\n');
     }, 500);
   }

@@ -606,3 +606,77 @@ pre {
 
 .cloud-kids { display: block; }
 .cloud-kids.collapsed { display: none; }
+
+/* ---------------- 自建模态对话框 ----------------
+ *
+ * 为什么不用内建的 alert/confirm/prompt:
+ * 实测在 Tauri 2 + WebView2 上它们**静默失效** —— 存在、能调用、
+ * 不报错,但既不显示对话框也不返回。于是 `if (!confirm(x)) return;`
+ * 永远走进 return,按钮看起来"没反应",而且没有任何错误信息。
+ * 所有删工程 / 删档案 / 开始同步 / 删云端文件都因此失效。
+ *
+ * app.js 里覆盖了这三个全局函数,这里是它们的样式。
+ */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.modal-box {
+  background: var(--bg-2);
+  border: 0.0625rem solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, 0.5);
+  padding: 1.25rem 1.375rem 1rem;
+  min-width: 20rem;
+  max-width: 34rem;
+  max-height: 80vh;
+  overflow: auto;
+}
+
+.modal-body {
+  color: var(--fg);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  /* 消息里有路径和换行 —— 必须保留,否则一长串读不了 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.modal-input {
+  margin-top: 0.75rem;
+  width: 100%;
+  padding: 0.4375rem 0.625rem;
+  background: var(--bg-3);
+  border: 0.0625rem solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 0.8125rem;
+}
+.modal-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1.125rem;
+}
+
+/* 实心红,用于确认框里的破坏性操作 —— 与 .btn.danger 的「描边警告」
+   不同,这个是"按下去就真删了"。 */
+.btn.danger-solid {
+  background: #8c3232;
+  border: 0.0625rem solid #a03c3c;
+  color: #fff;
+}
+.btn.danger-solid:hover { background: #a03c3c; }
