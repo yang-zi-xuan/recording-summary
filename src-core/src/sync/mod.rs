@@ -1015,7 +1015,11 @@ impl<'a> Syncer<'a> {
             std::collections::BTreeMap::new()
         };
 
-        inventory::build_inventory(&self.files, sel, &st, &remote)
+        // manifest 是"云端该有什么"的权威 —— 清单要用它过滤掉
+        // sync-state 里那些 manifest 已经删掉的陈旧记录
+        let manifest = crate::sync::manifest::Manifest::load_or_new(&self.files.manifest_path()).ok();
+
+        inventory::build_inventory(&self.files, sel, &st, &remote, manifest.as_ref())
     }
 
     /// 是否把工程里的录音一并同步。

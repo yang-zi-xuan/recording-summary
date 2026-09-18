@@ -274,6 +274,20 @@ impl SyncState {
             return match rec.and_then(|r| r.last_synced_at) {
                 None => SyncStatus::NeverSynced,
                 Some(_) => {
+                    // ★ 先确认云端**真的还在**。
+                    //
+                    //   原来这里只看本地:本地没了 + 策略允许删 = "待删除云端"。
+                    //   但云端可能早就没有了(比如上一次同步已经删掉,
+                    //   或者被手工清理过)。那种情况报"待删除云端"是错的 ——
+                    //   用户会去找一个**根本不存在的文件**,而且清单里
+                    //   挂着一个永远清不掉的条目。
+                    //
+                    //   `Some(false)` = 联网确认过,云端没有 → 两边都没了,
+                    //   对用户来说就是"这事已经结束了"。
+                    //   `None` = 没联网,不知道 → 保持原来的推断(乐观)。
+                    if remote_exists == Some(false) {
+                        return SyncStatus::Synced;
+                    }
                     if deletion_allowed {
                         SyncStatus::PendingDelete
                     } else {
@@ -469,6 +483,47 @@ mod tests {
         let st = s.status_of("a.md", true, None, Some(true), true);
         assert_eq!(st, SyncStatus::PendingDelete);
         assert!(st.needs_attention());
+    }
+
+    /// ★ 回归测试:云端也没有了就不该再报"待删除云端"。
+    ///
+    /// 用户实际报的问题:清单里挂着一个"待删除云端",但云端管理里
+    /// 根本找不到它。原来这里只看本地 —— 本地没了 + 策略允许删
+    /// 就直接报 `PendingDelete`,**从没确认云端是否真的还在**。
+    /// 于是被手工清理过、或上一次同步已经删掉的条目,会永远挂在清单上。
+    #[test]
+    fn remote_gone_means_nothing_left_to_delete() {
+        let s = state_with("a.md", true, Some(10));
+
+        // 联网确认过:云端没有 → 两边都没了,对用户来说这事结束了
+        let st = s.status_of("a.md", true, None, Some(false), true);
+        assert_eq!(
+            st,
+            SyncStatus::Synced,
+            "云端已经没有了,不该再报'待删除云端'"
+        );
+        assert!(!st.needs_attention(), "不该再要用户处理");
+    }
+
+    /// 反过来:确认云端**还在**时,必须照样报"待删除云端"。
+    #[test]
+    fn remote_present_still_reports_pending_delete() {
+        let s = state_with("a.md", true, Some(10));
+        assert_eq!(
+            s.status_of("a.md", true, None, Some(true), true),
+            SyncStatus::PendingDelete
+        );
+    }
+
+    /// 没联网(云端状态未知)时保持原来的推断 —— 不能因为不知道就当成没有。
+    #[test]
+    fn unknown_remote_keeps_the_optimistic_guess() {
+        let s = state_with("a.md", true, Some(10));
+        assert_eq!(
+            s.status_of("a.md", true, None, None, true),
+            SyncStatus::PendingDelete,
+            "不知道云端状态时,原有的推断不能变"
+        );
     }
 
     #[test]
