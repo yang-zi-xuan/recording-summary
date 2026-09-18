@@ -1125,32 +1125,69 @@ impl<'a> Syncer<'a> {
             });
         }
 
-        // ---- 本地已删除的文件 ----
+        // ---- 本地没有、但 manifest 里有的文件 ----
         //
-        // 判定条件(全部满足才会删):
-        // 1. manifest 里有这条记录,且不是墓碑
-        // 2. 本地确实没有这个文件
-        // 3. **这条记录是本机写的** —— 别的设备传的、本机还没下载的不算
-        // 4. 在同步范围内,且删除策略允许
+        // ★ 这个循环必须同时处理**两种**情况,早先只处理了第一种:
+        //
+        //   ① 本地删了 → 按删除策略删云端(`DeleteRemote`)
+        //   ② **云端有新文件 → 下载下来**(`Download`)
+        //
+        // ② 是"双向同步"的核心承诺之一,但原来**完全没实现** ——
+        // 循环只判 `should_delete_remote`,不判"要不要下载"。
+        // 于是别的设备传上来的文件、以及本机删了本地却保留云端的文件,
+        // **永远不会被拉下来**。这是个静默的缺口:计划里什么都不显示,
+        // 看起来就像"没什么可同步的"。
+        //
+        // 判定顺序按代价排:便宜的先做,只有真要下载时才发网络请求。
         for (rel, entry) in manifest.live_files() {
+            // 范围外的一律不碰 —— 与 locals 循环保持一致
+            if !self.selection.wants(rel) {
+                continue;
+            }
             if entry.is_tombstone() {
                 continue;
             }
-            if !entry.from_device(&self.device_id) {
-                continue; // 不是本机同步过的,保守跳过
-            }
             if self.files.root().join(rel).exists() {
-                continue; // 本地还在
+                continue; // 本地还在,已由 locals 循环处理
             }
-            if !self.selection.should_delete_remote(rel) {
-                continue; // 范围外或策略不允许
+            // 不是本机同步过的 → 别的设备传的,本机还没下载过
+            let from_me = entry.from_device(&self.device_id);
+
+            // ① 先看删除策略。本机删过、且策略允许 → 删云端
+            if from_me && self.selection.should_delete_remote(rel) {
+                items.push(PlanItem {
+                    rel_path: rel.clone(),
+                    action: Action::DeleteRemote,
+                    local_size: 0,
+                    remote_etag: entry.etag.clone(),
+                });
+                continue;
             }
-            items.push(PlanItem {
-                rel_path: rel.clone(),
-                action: Action::DeleteRemote,
-                local_size: 0,
-                remote_etag: entry.etag.clone(),
-            });
+
+            // ② 否则考虑下载。只有方向允许时才发请求
+            if !self.selection.direction.allows_download() {
+                continue;
+            }
+            // 离线计划不联网 —— 想下载就必须先确认云端真的有
+            if offline {
+                continue;
+            }
+            let remote = self
+                .rt()
+                .block_on(self.client.head_etag(rel))
+                .unwrap_or(None);
+            match decide_remote_only(from_me, entry.etag.as_deref(), remote.clone()) {
+                Some(Action::Download) => items.push(PlanItem {
+                    rel_path: rel.clone(),
+                    action: Action::Download,
+                    local_size: 0,
+                    remote_etag: remote,
+                }),
+                // 云端也没有(两边都没了)→ 什么都不做:
+                // manifest 里的记录留着,下次同步再判一次。
+                // 这里**不**删记录 —— 删了就没法区分"从没传过"和"传过又没了"。
+                _ => {}
+            }
         }
 
         items.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1385,6 +1422,36 @@ pub fn audio_sync_hint_for(store_root: &Path) -> String {
          大文件交给官方客户端更快,而且自带断点续传。",
         store_root.display()
     )
+}
+
+/// 决定"本地没有、manifest 里有"的文件该做什么。
+///
+/// 抽成纯函数是为了能测 —— [`Syncer::plan`] 需要真网络,而这里的
+/// 判定规则才是容易出错的部分(事实上有条分支**一直缺失**)。
+///
+/// 规则其实很短:**只要云端还有,就拉下来。** 返回 `None` 表示
+/// "云端也没有,什么都不做"。
+///
+/// # 为什么需要这个函数
+///
+/// 早先的 `plan_inner` 里,第二个循环**只**判"要不要删云端",
+/// 于是"本地删了、云端还留着"的文件**永远不会被拉回来**。
+/// 双向同步因此名不副实:它的下载方向只覆盖"本地从没有过"的文件,
+/// 覆盖不到"本地有过又删了"的。
+///
+/// 参数:`from_me` 表示 manifest 记录说这是**本机**同步的;
+/// `known_etag` 是 manifest 记的远端 ETag;`remote_etag` 是刚问到的。
+/// 后两个目前不参与判定 —— 保留它们是因为将来要区分
+/// "云端被别的设备改过"(该拉)和"只是本地删了"(可能该推)。
+fn decide_remote_only(
+    _from_me: bool,
+    _known_etag: Option<&str>,
+    remote_etag: Option<String>,
+) -> Option<Action> {
+    // 云端没有 → 两边都没了。等下次同步再判;
+    // **不在这里清 manifest** —— 清了就没法区分"从没传过"和"传过又没了"。
+    remote_etag?;
+    Some(Action::Download)
 }
 
 #[cfg(test)]
@@ -1911,8 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn action_equality_is_usable_in_tests() {
-        assert_eq!(Action::Upload, Action::Upload);
+    fn action_equality_is_usable_in_tests() {        assert_eq!(Action::Upload, Action::Upload);
         assert_ne!(Action::Skip, Action::Download);
     }
 
@@ -1949,5 +2015,78 @@ mod tests {
         assert!(h.contains("Seafile"), "{h}");
         assert!(h.contains("断点续传"), "{h}");
         assert!(h.contains("批量小文件"), "提示应说明原因:{h}");
+    }
+
+    // -----------------------------------------------------------------------
+    // "本地没有、manifest 里有"的判定
+    // -----------------------------------------------------------------------
+
+    /// ★ 回归测试:云端有的文件必须能下载。
+    ///
+    /// 这是"双向同步"的核心承诺之一。原来 `plan_inner` 的第二个循环
+    /// **只**判"要不要删云端",所以"本地删了、云端还留着"的文件
+    /// 永远不会被拉回来 —— 计划里什么都不显示,看起来就像
+    /// "没什么可同步的",**完全静默**。
+    ///
+    /// 用户的场景:云端有一份完整的工程,本地那份被删了,
+    /// 他想同步下来 —— 结果什么都不会发生。
+    #[test]
+    fn remote_only_file_is_downloaded() {
+        // 别的设备传的,本机从没见过
+        assert_eq!(
+            decide_remote_only(false, None, Some("etag-1".into())),
+            Some(Action::Download)
+        );
+        // 本机传过,本地后来删了,云端还在
+        assert_eq!(
+            decide_remote_only(true, Some("etag-1"), Some("etag-1".into())),
+            Some(Action::Download)
+        );
+        // 云端被改过
+        assert_eq!(
+            decide_remote_only(true, Some("etag-old"), Some("etag-new".into())),
+            Some(Action::Download)
+        );
+    }
+
+    /// 云端也没有 → 什么都不做,且**不改 manifest**。
+    ///
+    /// 这条记录要留着:删了就区分不出"从没传过"和"传过又没了"。
+    #[test]
+    fn missing_on_both_sides_plans_nothing() {
+        assert_eq!(decide_remote_only(true, Some("etag-1"), None), None);
+        assert_eq!(decide_remote_only(false, None, None), None);
+    }
+
+    /// 方向为"只上传"时不能下载 —— 否则 `--direction upload`
+    /// 会把云端的东西拉下来,与用户的意图相反。
+    #[test]
+    fn upload_only_direction_never_downloads() {
+        use crate::sync::selection::Direction;
+        assert!(!Direction::UploadOnly.allows_download());
+        assert!(Direction::Both.allows_download());
+        assert!(Direction::DownloadOnly.allows_download());
+    }
+
+    /// 删除策略允许且记录是本机的 → 该判删,而不是下载。
+    ///
+    /// 这是上面那条的前置条件:只有**删除策略不允许**时,
+    /// 云端的残留才该被拉回来。
+    #[test]
+    fn delete_wins_over_download_when_policy_allows() {
+        use crate::sync::selection::{DeletionPolicy, SyncSelection};
+        let sel = SyncSelection::all();
+
+        // 文本 + 默认策略(text)→ 允许删
+        assert!(sel.should_delete_remote("projects/x/transcript.md"));
+        // 音频 + 默认策略 → **不**允许删(音频只增不减)
+        assert!(!sel.should_delete_remote("projects/x/audio/recording.m4a"));
+
+        // 策略改成 keep 就什么都不删
+        let keep = SyncSelection {
+            deletion: DeletionPolicy::Keep,
+            ..SyncSelection::all()
+        };
+        assert!(!keep.should_delete_remote("projects/x/transcript.md"));
     }
 }
